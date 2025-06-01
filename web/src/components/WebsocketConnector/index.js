@@ -9,6 +9,14 @@ import { orderUpdate, watchToken, updateTokenLockedBalances } from '../../action
 import { tradeUpdate, marketTrade } from '../../actions/trade';
 import { sleep } from '../../lib/utils';
 import { getSelectedAccount } from '@gongddex/hydro-sdk-wallet';
+import { store } from '../../index'; // Import store
+import { getAddress } from '../../selectors/account'; // To get current user's address
+import {
+  handleMarginAccountUpdate,
+  handleMarginAlert,
+  // handleAuctionUpdate, // If auctions are to be handled
+} from '../../actions/marginActions';
+import { utils } from 'web3'; // Assuming web3.utils for logInfo or similar if used by hydro-sdk-backend utils
 
 const mapStateToProps = state => {
   const selectedAccount = getSelectedAccount(state);
@@ -164,6 +172,19 @@ class WebsocketConnector extends React.PureComponent {
       while (this.preEvents.length > 0) {
         this.socket.send(this.preEvents.shift());
       }
+
+      // Subscribe to margin updates if user is logged in
+      const state = store.getState();
+      const currentUserAddressForSubscription = getAddress(state);
+      if (this.socket && this.socket.readyState === WebSocket.OPEN && currentUserAddressForSubscription) {
+        this.socket.send(JSON.stringify({
+          type: "SUBSCRIBE_MARGIN_UPDATES", // Matches backend expectation
+          payload: { address: currentUserAddressForSubscription }
+        }));
+        // Consider using a more robust logging mechanism if utils.logInfo is not available/intended
+        console.log(`Subscribed to margin updates for ${currentUserAddressForSubscription}`);
+      }
+
     };
     this.socket.onclose = event => {
       dispatch(setConfigs({ websocketConnected: false }));
@@ -172,11 +193,15 @@ class WebsocketConnector extends React.PureComponent {
       console.log('wsError', event);
     };
     this.socket.onmessage = event => {
-      const data = JSON.parse(event.data);
-      const { currentMarket, address } = this.props;
-      switch (data.type) {
+      const message = JSON.parse(event.data); // Renamed data to message for clarity
+      const { currentMarket } = this.props; // address from props might be stale, get from store
+
+      const state = store.getState();
+      const currentUserAddress = getAddress(state);
+
+      switch (message.type) {
         case 'level2OrderbookSnapshot':
-          if (data.marketID !== currentMarket.id) {
+          if (message.marketID !== currentMarket.id) {
             break;
           }
 
@@ -188,31 +213,31 @@ class WebsocketConnector extends React.PureComponent {
           if (data.marketID !== currentMarket.id) {
             break;
           }
-          dispatch(updateOrderbook(data.side, new BigNumber(data.price), new BigNumber(data.amount)));
+          dispatch(updateOrderbook(message.side, new BigNumber(message.price), new BigNumber(message.amount)));
           break;
         case 'orderChange':
-          if (data.order.marketID === currentMarket.id) {
-            dispatch(orderUpdate(data.order));
+          if (message.order.marketID === currentMarket.id) { // Ensure currentMarket is not null
+            dispatch(orderUpdate(message.order));
           }
           break;
         case 'lockedBalanceChange':
           dispatch(
             updateTokenLockedBalances({
-              [data.symbol]: data.balance
+              [message.symbol]: message.balance
             })
           );
           break;
         case 'tradeChange':
-          if (data.trade.marketID === currentMarket.id) {
-            dispatch(tradeUpdate(data.trade));
+          if (message.trade.marketID === currentMarket.id) { // Ensure currentMarket is not null
+            dispatch(tradeUpdate(message.trade));
           }
           break;
         case 'newMarketTrade':
-          if (data.trade.marketID !== currentMarket.id) {
+          if (!currentMarket || message.trade.marketID !== currentMarket.id) {
             break;
           }
-          dispatch(marketTrade(data.trade));
-          if (address) {
+          dispatch(marketTrade(message.trade));
+          if (currentUserAddress) { // Use refreshed currentUserAddress
             dispatch(
               watchToken(currentMarket.baseTokenAddress, currentMarket.baseToken, currentMarket.baseTokenDecimals)
             );
@@ -221,7 +246,26 @@ class WebsocketConnector extends React.PureComponent {
             );
           }
           break;
+
+        // Margin Trading WebSocket Message Handling
+        case 'MARGIN_ACCOUNT_UPDATE':
+          if (message.payload && (!message.payload.userAddress || message.payload.userAddress === currentUserAddress)) {
+            store.dispatch(handleMarginAccountUpdate(message.payload));
+          }
+          break;
+
+        case 'MARGIN_ALERT':
+          if (message.payload && (!message.payload.userAddress || message.payload.userAddress === currentUserAddress)) {
+            store.dispatch(handleMarginAlert(message.payload));
+          }
+          break;
+
+        // case 'AUCTION_UPDATE':
+        //   store.dispatch(handleAuctionUpdate(message.payload));
+        //   break;
+
         default:
+          // console.log("Received unhandled WebSocket message type: ", message.type);
           break;
       }
     };

@@ -45,7 +45,31 @@ const api = {
   head: (url, ...args) => _request('head', url, ...args),
   post: (url, ...args) => _request('post', url, ...args),
   put: (url, ...args) => _request('put', url, ...args),
-  patch: (url, ...args) => _request('patch', url, ...args)
+  patch: (url, ...args) => _request('patch', url, ...args),
+
+  // Margin Account Details
+  getMarginAccountDetails: (marketID, userAddress) => {
+    return _request('get', `/margin/accounts/${marketID}?user=${userAddress}`);
+  },
+
+  // Collateral Management
+  depositToCollateral: (data) => { // data: { marketID, assetAddress, amount }
+    return _request('post', '/margin/collateral/deposit', data);
+  },
+  withdrawFromCollateral: (data) => { // data: { marketID, assetAddress, amount }
+    return _request('post', '/margin/collateral/withdraw', data);
+  },
+
+  // Loan Management
+  borrowLoan: (data) => { // data: { marketID, assetAddress, amount }
+    return _request('post', '/margin/loans/borrow', data);
+  },
+  repayLoan: (data) => { // data: { marketID, assetAddress, amount }
+    return _request('post', '/margin/loans/repay', data);
+  },
+  getLoans: (marketID, userAddress) => {
+    return _request('get', `/margin/loans?marketID=${marketID}&user=${userAddress}`);
+  }
 };
 
 export default api;

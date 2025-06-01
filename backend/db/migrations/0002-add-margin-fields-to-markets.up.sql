@@ -1,0 +1,6 @@
+ALTER TABLE markets
+ADD COLUMN borrow_enable BOOLEAN DEFAULT FALSE,
+ADD COLUMN liquidate_rate DECIMAL DEFAULT 0,
+ADD COLUMN withdraw_rate DECIMAL DEFAULT 0,
+ADD COLUMN auction_ratio_start DECIMAL DEFAULT 0,
+ADD COLUMN auction_ratio_per_block DECIMAL DEFAULT 0;

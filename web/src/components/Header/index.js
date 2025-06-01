@@ -53,12 +53,23 @@ class Header extends React.PureComponent {
             aria-labelledby="dropdownMenuButton"
             style={{ maxHeight: 350, overflow: 'auto' }}>
             {markets.map(market => {
+              const isMarginEnabled = market.get('borrowEnable', false);
+              // Ensure liquidateRate is a string or has toString() if it's a BigNumber/Decimal
+              const liquidateRate = market.get('liquidateRate');
+              const liquidateRateDisplay = liquidateRate ? (typeof liquidateRate.toString === 'function' ? liquidateRate.toString() : String(liquidateRate)) : 'N/A';
+
+              const displayMarketId = isMarginEnabled ? `${market.id} (M)` : market.id;
+              const title = isMarginEnabled
+                ? `Margin trading enabled. Liquidation Rate: ${liquidateRateDisplay}`
+                : 'Spot trading only';
+
               return (
                 <button
                   className="dropdown-item"
                   key={market.id}
+                  title={title}
                   onClick={() => currentMarket.id !== market.id && dispatch(updateCurrentMarket(market))}>
-                  {market.id}
+                  {displayMarketId}
                 </button>
               );
             })}

@@ -32,6 +32,11 @@ type Market struct {
 	TakerFeeRate      decimal.Decimal `json:"takerFeeRate"      db:"taker_fee_rate"`
 	GasUsedEstimation int             `json:"gasUsedEstimation" db:"gas_used_estimation"`
 	IsPublished       bool            `json:"isPublished"       db:"is_published"`
+	BorrowEnable bool `json:"borrowEnable" db:"borrow_enable"`
+	LiquidateRate decimal.Decimal `json:"liquidateRate" db:"liquidate_rate"`
+	WithdrawRate decimal.Decimal `json:"withdrawRate" db:"withdraw_rate"`
+	AuctionRatioStart decimal.Decimal `json:"auctionRatioStart" db:"auction_ratio_start"`
+	AuctionRatioPerBlock decimal.Decimal `json:"auctionRatioPerBlock" db:"auction_ratio_per_block"`
 }
 
 func (Market) TableName() string {

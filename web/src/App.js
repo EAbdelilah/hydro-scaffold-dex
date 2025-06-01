@@ -2,6 +2,7 @@ import React from 'react';
 import { connect } from 'react-redux';
 import { loadMarkets, loadTradeHistory } from './actions/markets';
 import Header from './components/Header';
+import GlobalNotifications from './components/GlobalNotifications'; // Added import
 import WebsocketConnector from './components/WebsocketConnector';
 import OrderBook from './components/Orderbook';
 import Trade from './components/Trade';
@@ -72,6 +73,7 @@ class App extends React.PureComponent {
         <SDKWallet title="Starter Kit Wallet" nodeUrl={env.NODE_URL} defaultWalletType="Hydro-Wallet" />
         <WebsocketConnector />
         <Header />
+        <GlobalNotifications /> {/* Added component here */}
         {selectedAccountID === 'EXTENSION' && parseInt(networkId, 10) !== parseInt(env.NETWORK_ID, 10) && (
           <span className="network-warning bg-warning text-white text-center" style={{ padding: 4 }}>
             Network Error: Switch Metamask's network to {this.getNetworkName()}.

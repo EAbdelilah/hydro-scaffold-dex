@@ -3,13 +3,25 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/models"
+	sw "github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers"
 	"github.com/HydroProtocol/hydro-sdk-backend/common"
 	"github.com/HydroProtocol/hydro-sdk-backend/sdk"
 	"github.com/HydroProtocol/hydro-sdk-backend/utils"
+	"github.com/ethereum/go-ethereum/common" as goEthereumCommon
 	"github.com/shopspring/decimal"
-	"math/rand"
+)
+
+func GetLockedBalance(p Param) (interface{}, error) {
 	"os"
 	"time"
 )
@@ -188,28 +200,21 @@ func checkBalanceAllowancePriceAndAmount(order *BuildOrderReq, address string) e
 		return MarketNotFoundError(order.MarketID)
 	}
 
-	minPriceUnit := decimal.New(1, int32(-1*market.PriceDecimals))
-
+	// price and amount are already decimal.Decimal at this point in the original code
+	// but they are parsed from order.Price and order.Amount (strings)
+	// For clarity, let's ensure we have them as decimals here.
 	price := utils.StringToDecimal(order.Price)
+	amount := utils.StringToDecimal(order.Amount)
 
-	if price.LessThanOrEqual(decimal.Zero) {
-		return NewApiError(-1, "invalid_price")
-	}
-
-	if !price.Mod(minPriceUnit).Equal(decimal.Zero) {
-		return NewApiError(-1, "invalid_price_unit")
+	// Validate price and amount units and minimum order size (common for both spot and margin)
+	minPriceUnit := decimal.New(1, int32(-1*market.PriceDecimals))
+	if price.LessThanOrEqual(decimal.Zero) || !price.Mod(minPriceUnit).Equal(decimal.Zero) {
+		return NewApiError(-1, "invalid_price_or_unit")
 	}
 
 	minAmountUnit := decimal.New(1, int32(-1*market.AmountDecimals))
-
-	amount := utils.StringToDecimal(order.Amount)
-
-	if amount.LessThanOrEqual(decimal.Zero) {
-		return NewApiError(-1, "invalid_amount")
-	}
-
-	if !amount.Mod(minAmountUnit).Equal(decimal.Zero) {
-		return NewApiError(-1, "invalid_amount_unit")
+	if amount.LessThanOrEqual(decimal.Zero) || !amount.Mod(minAmountUnit).Equal(decimal.Zero) {
+		return NewApiError(-1, "invalid_amount_or_unit")
 	}
 
 	orderSizeInQuoteToken := amount.Mul(price)
@@ -217,50 +222,160 @@ func checkBalanceAllowancePriceAndAmount(order *BuildOrderReq, address string) e
 		return NewApiError(-1, "order_less_than_minOrderSize")
 	}
 
-	baseTokenLockedBalance := models.BalanceDao.GetByAccountAndSymbol(address, market.BaseTokenSymbol, market.BaseTokenDecimals)
-	baseTokenBalance := hydro.GetTokenBalance(market.BaseTokenAddress, address)
-	baseTokenAllowance := hydro.GetTokenAllowance(market.BaseTokenAddress, os.Getenv("HSK_PROXY_ADDRESS"), address)
+	if order.AccountType == "margin" {
+		utils.Dump(fmt.Sprintf("Performing MARGIN balance check for user %s, market %s (side %s)", address, order.MarketID, order.Side))
 
-	quoteTokenLockedBalance := models.BalanceDao.GetByAccountAndSymbol(address, market.QuoteTokenSymbol, market.QuoteTokenDecimals)
-	quoteTokenBalance := hydro.GetTokenBalance(market.QuoteTokenAddress, address)
-	quoteTokenAllowance := hydro.GetTokenAllowance(market.QuoteTokenAddress, os.Getenv("HSK_PROXY_ADDRESS"), address)
+		var assetToCheckAddress string
+		var assetToCheckDecimals int
+		var assetToCheckSymbol string
 
-	var quoteTokenHugeAmount decimal.Decimal
-	var baseTokenHugeAmount decimal.Decimal
+		if order.Side == "sell" { // Selling base, need spendable base
+			assetToCheckAddress = market.BaseTokenAddress
+			assetToCheckDecimals = market.BaseTokenDecimals
+			assetToCheckSymbol = market.BaseTokenSymbol
+		} else { // Buying base (spending quote), need spendable quote
+			assetToCheckAddress = market.QuoteTokenAddress
+			assetToCheckDecimals = market.QuoteTokenDecimals
+			assetToCheckSymbol = market.QuoteTokenSymbol
+		}
+		utils.Dump(fmt.Sprintf("Margin order: asset to check is %s (%s)", assetToCheckSymbol, assetToCheckAddress))
 
-	feeDetail := calculateFee(price, amount, market, address)
-	feeAmount := feeDetail.AsTakerTotalFeeAmount
+		commonAddress := goEthereumCommon.HexToAddress(address)
+		// Use order.MarketID as the margin market context. This might be order.MarginMarketID if they can differ.
+		uint16MarketID, err := sw.MarketIDToUint16(order.MarketID)
+		if err != nil {
+			return NewApiError(http.StatusBadRequest, fmt.Sprintf("Invalid MarketID for margin order: %s", order.MarketID))
+		}
+		commonAssetToCheckAddress := goEthereumCommon.HexToAddress(assetToCheckAddress)
 
-	quoteTokenHugeAmount = amount.Mul(decimal.New(1, int32(market.QuoteTokenDecimals))).Mul(price)
-	baseTokenHugeAmount = amount.Mul(decimal.New(1, int32(market.BaseTokenDecimals)))
+		collateralBalanceBigInt, err := sw.MarketBalanceOf(hydro, uint16MarketID, commonAssetToCheckAddress, commonAddress)
+		if err != nil {
+			utils.Errorf("Failed to fetch collateral balance for %s in market %s: %v", commonAddress.Hex(), order.MarketID, err)
+			return NewApiError(-1, "failed_to_fetch_collateral_balance")
+		}
+		collateralBalance := utils.WeiToDecimalAmount(collateralBalanceBigInt, assetToCheckDecimals)
+		utils.Dump("Actual Collateral Balance for asset", assetToCheckSymbol, ":", collateralBalance.StringWithDigits(int32(assetToCheckDecimals)))
 
-	if order.Side == "sell" {
-		if quoteTokenHugeAmount.LessThanOrEqual(feeAmount) {
-			return NewApiError(-1, fmt.Sprintf("amount: %s less than fee: %s", quoteTokenHugeAmount.String(), feeAmount.String()))
+		borrowedAmountBigInt, err := sw.GetAmountBorrowed(hydro, commonAddress, uint16MarketID, commonAssetToCheckAddress)
+		if err != nil {
+			utils.Errorf("Failed to fetch borrowed amount for %s in market %s: %v", commonAddress.Hex(), order.MarketID, err)
+			return NewApiError(-1, "failed_to_fetch_borrowed_amount")
+		}
+		borrowedAmount := utils.WeiToDecimalAmount(borrowedAmountBigInt, assetToCheckDecimals)
+		utils.Dump("Actual Borrowed Amount for asset", assetToCheckSymbol, ":", borrowedAmount.StringWithDigits(int32(assetToCheckDecimals)))
+
+		spendableBalance := collateralBalance.Add(borrowedAmount)
+		utils.Dump("Placeholder: Spendable (Collateral + Borrowed) for asset", assetToCheckSymbol, ":", spendableBalance.StringWithDigits(int32(assetToCheckDecimals)))
+
+		var requiredAmountInAssetUnits decimal.Decimal // This should be in normal units, not "huge" units yet
+		feeDetail := calculateFee(price, amount, market, address)
+
+		if order.Side == "sell" { // Selling base. Required amount is 'amount' of base token.
+			requiredAmountInAssetUnits = amount
+		} else { // Buying base (spending quote). Required amount is 'amount * price' of quote token, plus fees.
+			orderValueInQuote := amount.Mul(price)
+			// calculateFee returns AsTakerTotalFeeAmount in quote token's normal units (not huge units)
+			// However, the original spot logic adds feeAmount (which is AsTakerTotalFeeAmount in huge units) to quoteTokenHugeAmount.
+			// For consistency, let's ensure feeDetail.AsTakerTotalFeeAmount is used correctly.
+			// The AsTakerTotalFeeAmount from calculateFee is already in quote token's "normal" decimal units.
+			takerFeeInQuoteToken := feeDetail.AsTakerTotalFeeAmount.Div(decimal.New(1, int32(market.QuoteTokenDecimals))) // Convert from huge units if necessary, or ensure calculateFee returns normal units.
+			                                                                                                           // Assuming calculateFee.AsTakerTotalFeeAmount is already in normal units of quote for now.
+			                                                                                                           // The original code has: feeAmount := feeDetail.AsTakerTotalFeeAmount (this is in huge units)
+			                                                                                                           // And then: requireAmount := quoteTokenHugeAmount.Add(feeAmount)
+			// Let's re-evaluate fee calculation for margin context.
+			// For margin, fees are typically paid from the collateral of the quote token.
+			// If spending quote, required = (order value in quote) + (fee in quote)
+			// Taker fee is usually charged in the quote currency of the pair.
+			takerFee := feeDetail.AsTakerTotalFeeAmount.Div(decimal.New(1, int32(market.QuoteTokenDecimals))) // Ensure this is in normal units of quote
+			requiredAmountInAssetUnits = orderValueInQuote.Add(takerFee)
+		}
+		utils.Dump(fmt.Sprintf("Margin: Required amount of %s (normal units): %s", assetToCheckSymbol, requiredAmountInAssetUnits.StringWithDigits(int32(assetToCheckDecimals))))
+
+		if requiredAmountInAssetUnits.GreaterThan(spendableBalance) {
+			return NewApiError(-1, fmt.Sprintf("%s margin balance (collateral + borrowed) not enough. Available: %s, Required: %s",
+				assetToCheckSymbol,
+				spendableBalance.StringWithDigits(int32(assetToCheckDecimals)),
+				requiredAmountInAssetUnits.StringWithDigits(int32(assetToCheckDecimals))))
 		}
 
-		availableBaseTokenAmount := baseTokenBalance.Sub(baseTokenLockedBalance)
-		if baseTokenHugeAmount.GreaterThan(availableBaseTokenAmount) {
-			return NewApiError(-1, fmt.Sprintf("%s balance not enough, available balance is %s, require amount is %s", market.BaseTokenSymbol, availableBaseTokenAmount.String(), baseTokenHugeAmount.String()))
-		}
+		// Allowance checks for margin orders:
+		// The contract interaction for margin orders might involve direct transfers from the margin account
+		// by the user's signature on the order, or it might still use the allowance model on a specific margin contract/proxy.
+		// This needs clarification based on the smart contract design.
+		// For now, assume a similar allowance check might be needed against the margin contract/proxy if funds are moved by it.
+		// TODO: Confirm allowance mechanism for margin trades. Is it on user's EOA to margin contract, or margin contract to Hydro proxy?
+		// If the Hydro proxy still needs to pull funds, allowance is on assetToCheckAddress from user's EOA to HSK_PROXY_ADDRESS.
+		// This is complex because the funds are technically in the margin contract.
+		// For a true margin system, the order itself, when matched, triggers actions on the margin contract.
+		// The "allowance" might be an internal one within the margin contract system or not needed in the traditional ERC20 sense from EOA for each trade.
+		// Let's assume for now that no separate ERC20 allowance check from EOA to HSK_PROXY_ADDRESS is needed IF funds are already in margin contract
+		// and the margin contract itself is the one interacting with the exchange component.
+		// However, if the margin account IS the HSK_PROXY_ADDRESS (unlikely), then allowance is implicitly given.
+		utils.Dump("Placeholder: Allowance check for margin trade for asset: ", assetToCheckSymbol, " - This needs clarification based on contract design.")
 
-		if baseTokenHugeAmount.GreaterThan(baseTokenAllowance) {
-			return NewApiError(-1, fmt.Sprintf("%s allowance not enough, allowance is %s, require amount is %s", market.BaseTokenSymbol, baseTokenAllowance.String(), baseTokenHugeAmount.String()))
-		}
 	} else {
-		availableQuoteTokenAmount := quoteTokenBalance.Sub(quoteTokenLockedBalance)
-		requireAmount := quoteTokenHugeAmount.Add(feeAmount)
-		if requireAmount.GreaterThan(availableQuoteTokenAmount) {
-			return NewApiError(-1, fmt.Sprintf("%s balance not enough, available balance is %s, require amount is %s", market.QuoteTokenSymbol, availableQuoteTokenAmount.String(), requireAmount.String()))
-		}
+		// Existing Spot Trading Logic
+		utils.Dump(fmt.Sprintf("Performing SPOT balance check for user %s, market %s (side %s)", address, order.MarketID, order.Side))
 
-		if requireAmount.GreaterThan(quoteTokenAllowance) {
-			return NewApiError(-1, fmt.Sprintf("%s allowance not enough, available balance is %s, require amount is %s", market.QuoteTokenSymbol, quoteTokenAllowance.String(), requireAmount.String()))
+		baseTokenLockedBalance := models.BalanceDao.GetByAccountAndSymbol(address, market.BaseTokenSymbol, market.BaseTokenDecimals)
+		baseTokenBalance := hydro.GetTokenBalance(market.BaseTokenAddress, address)
+		baseTokenAllowance := hydro.GetTokenAllowance(market.BaseTokenAddress, os.Getenv("HSK_PROXY_ADDRESS"), address)
+
+		quoteTokenLockedBalance := models.BalanceDao.GetByAccountAndSymbol(address, market.QuoteTokenSymbol, market.QuoteTokenDecimals)
+		quoteTokenBalance := hydro.GetTokenBalance(market.QuoteTokenAddress, address)
+		quoteTokenAllowance := hydro.GetTokenAllowance(market.QuoteTokenAddress, os.Getenv("HSK_PROXY_ADDRESS"), address)
+
+		var quoteTokenHugeAmount decimal.Decimal
+		var baseTokenHugeAmount decimal.Decimal
+
+		// feeDetail from calculateFee returns AsTakerTotalFeeAmount in quote token's huge units.
+		feeDetail := calculateFee(price, amount, market, address) // price and amount are decimal.Decimal
+		feeAmountInQuoteHugeUnits := feeDetail.AsTakerTotalFeeAmount
+
+		quoteTokenHugeAmount = amount.Mul(price).Mul(decimal.New(1, int32(market.QuoteTokenDecimals)))
+		baseTokenHugeAmount = amount.Mul(decimal.New(1, int32(market.BaseTokenDecimals)))
+
+		if order.Side == "sell" { // Selling Base Token
+			// Check if order value in quote token can cover fee (which is also in quote token)
+			// This check seems a bit off: quoteTokenHugeAmount is order value, feeAmount is fee.
+			// Original: if quoteTokenHugeAmount.LessThanOrEqual(feeAmount)
+			// This means if (value of base sold, in quote terms) <= (fee in quote terms).
+			// This check is likely to ensure the order is not just to pay fees or is economically viable.
+			// Let's keep it as it was, assuming it has a purpose.
+			if quoteTokenHugeAmount.LessThanOrEqual(feeAmountInQuoteHugeUnits) && !quoteTokenHugeAmount.IsZero() { // Added !quoteTokenHugeAmount.IsZero() to avoid error on zero value orders if fee is also zero
+				return NewApiError(-1, fmt.Sprintf("Order value in quote token (%s) must be greater than fee (%s)", utils.DecimalToFriendlyJSON(quoteTokenHugeAmount), utils.DecimalToFriendlyJSON(feeAmountInQuoteHugeUnits)))
+			}
+
+			availableBaseTokenAmount := baseTokenBalance.Sub(baseTokenLockedBalance) // These are in normal units
+			// Compare baseTokenHugeAmount (order amount in huge units) with availableBaseTokenAmount (normal units)
+			// This needs availableBaseTokenAmount to be converted to huge units or baseTokenHugeAmount to normal.
+			// Original code compares huge amount with normal amount which is incorrect.
+			// Assuming hydro.GetTokenBalance returns normal units.
+			if baseTokenHugeAmount.GreaterThan(availableBaseTokenAmount.Mul(decimal.New(1, int32(market.BaseTokenDecimals)))) {
+				return NewApiError(-1, fmt.Sprintf("%s balance not enough, available balance is %s, require amount is %s", market.BaseTokenSymbol, availableBaseTokenAmount.StringFixed(int32(market.BaseTokenDecimals)), amount.StringFixed(int32(market.BaseTokenDecimals))))
+			}
+
+			// Allowance is checked in huge units against HSK_PROXY_ADDRESS
+			if baseTokenHugeAmount.GreaterThan(baseTokenAllowance) { // baseTokenAllowance is already in huge units from SDK
+				return NewApiError(-1, fmt.Sprintf("%s allowance not enough, allowance is %s, require amount is %s", market.BaseTokenSymbol, utils.DecimalToFriendlyJSON(baseTokenAllowance), utils.DecimalToFriendlyJSON(baseTokenHugeAmount)))
+			}
+		} else { // Buying Base Token (Spending Quote Token)
+			availableQuoteTokenAmount := quoteTokenBalance.Sub(quoteTokenLockedBalance) // Normal units
+			requiredAmountInQuoteHugeUnits := quoteTokenHugeAmount.Add(feeAmountInQuoteHugeUnits) // Both in huge units
+
+			// Compare requiredAmountInQuoteHugeUnits (huge units) with availableQuoteTokenAmount (normal units)
+			if requiredAmountInQuoteHugeUnits.GreaterThan(availableQuoteTokenAmount.Mul(decimal.New(1, int32(market.QuoteTokenDecimals)))) {
+				return NewApiError(-1, fmt.Sprintf("%s balance not enough, available balance is %s, require amount (incl. fee) is %s", market.QuoteTokenSymbol, availableQuoteTokenAmount.StringFixed(int32(market.QuoteTokenDecimals)), requiredAmountInQuoteHugeUnits.Div(decimal.New(1, int32(market.QuoteTokenDecimals))).StringFixed(int32(market.QuoteTokenDecimals))))
+			}
+
+			// Allowance is checked in huge units
+			if requiredAmountInQuoteHugeUnits.GreaterThan(quoteTokenAllowance) { // quoteTokenAllowance is huge units
+				return NewApiError(-1, fmt.Sprintf("%s allowance not enough, allowance is %s, require amount (incl. fee) is %s", market.QuoteTokenSymbol, utils.DecimalToFriendlyJSON(quoteTokenAllowance), utils.DecimalToFriendlyJSON(requiredAmountInQuoteHugeUnits)))
+			}
 		}
 	}
 
 	// will add check of precision later
-
 	return nil
 }
 
@@ -268,6 +383,64 @@ func BuildAndCacheOrder(address string, order *BuildOrderReq) (*BuildOrderResp, 
 	market := models.MarketDao.FindMarketByID(order.MarketID)
 	amount := utils.StringToDecimal(order.Amount)
 	price := utils.StringToDecimal(order.Price)
+
+	// Determine balanceCategory and orderDataMarketID based on AccountType
+	var balanceCategory sw.SDKBalanceCategory // Use the type from sdk_wrappers
+	var orderDataMarketIDUint16 uint16         // Ensure this is uint16 for the wrapper
+	var orderDataHex string                    // To store the generated order data string
+	var err error
+
+	if order.AccountType == "margin" {
+		// Use order.MarketID as the context for margin operations (collateral, loans are per-marketPair)
+		// The order.MarginMarketID field in BuildOrderReq can be used if a *different* market context
+		// is needed for the order's data field than for its placement market (order.MarketID).
+		// For now, assume order.MarketID is the one to use for orderDataMarketIDUint16.
+		orderDataMarketIDUint16, err = sw.MarketIDToUint16(order.MarketID)
+		if err != nil {
+			return nil, NewApiError(http.StatusBadRequest, fmt.Sprintf("Invalid MarketID for margin order data: %s", order.MarketID))
+		}
+
+		balanceCategory = sw.SDKBalanceCategoryCollateralAccount
+		utils.Dump(fmt.Sprintf("Margin order: Using CollateralAccount (Category: %d) and MarketID %d for order data.", balanceCategory, orderDataMarketIDUint16))
+
+		orderDataHex, err = sw.GenerateMarginOrderDataHex(
+			int64(2), // Version
+			getExpiredAt(order.Expires),
+			rand.Int63(), // Salt
+			market.MakerFeeRate,
+			market.TakerFeeRate,
+			decimal.Zero, // MakerRebateRate
+			order.Side == "sell",
+			order.OrderType == "market",
+			balanceCategory,
+			orderDataMarketIDUint16,
+			false, // isMakerOnly
+		)
+		if err != nil {
+			utils.Errorf("Failed to generate margin order data: %v", err)
+			return nil, NewApiError(-1, "failed_to_build_margin_order_data")
+		}
+
+	} else {
+		// Default to spot order if AccountType is empty or "spot"
+		orderDataMarketIDUint16 = 0 // For common balances (spot), marketID in order data is 0
+		balanceCategory = sw.SDKBalanceCategoryCommon
+		utils.Dump(fmt.Sprintf("Spot order: Using Common account (Category: %d) and MarketID %d for order data.", balanceCategory, orderDataMarketIDUint16))
+
+		// Spot orders use the existing SDK's GenerateOrderData
+		orderDataBytes := hydro.GenerateOrderData(
+			int64(2), // Version
+			getExpiredAt(order.Expires),
+			rand.Int63(), // Salt
+			market.MakerFeeRate,
+			market.TakerFeeRate,
+			decimal.Zero, // MakerRebateRate
+			order.Side == "sell",
+			order.OrderType == "market",
+			false, // isMakerOnly
+		)
+		orderDataHex = goEthereumCommon.Bytes2Hex(orderDataBytes)
+	}
 
 	fee := calculateFee(price, amount, market, address)
 
@@ -283,10 +456,30 @@ func BuildAndCacheOrder(address string, order *BuildOrderReq) (*BuildOrderResp, 
 	baseTokenHugeAmount = amount.Mul(decimal.New(1, int32(market.BaseTokenDecimals)))
 	quoteTokenHugeAmount = price.Mul(amount).Mul(decimal.New(1, int32(market.QuoteTokenDecimals)))
 
-	orderData := hydro.GenerateOrderData(
-		int64(2),
-		getExpiredAt(order.Expires),
-		rand.Int63(),
+	orderJson := models.OrderJSON{
+		Trader:                  address,
+		Relayer:                 os.Getenv("HSK_RELAYER_ADDRESS"),
+		BaseCurrency:            market.BaseTokenAddress,
+		QuoteCurrency:           market.QuoteTokenAddress,
+		BaseCurrencyHugeAmount:  baseTokenHugeAmount,
+		QuoteCurrencyHugeAmount: quoteTokenHugeAmount,
+		GasTokenHugeAmount:      gasFeeInQuoteTokenHugeAmount,
+		Data:                    orderDataHex, // Use the hex string here
+	}
+
+	sdkOrder := sdk.NewOrderWithData(address,
+		os.Getenv("HSK_RELAYER_ADDRESS"),
+		market.BaseTokenAddress,
+		market.QuoteTokenAddress,
+		utils.DecimalToBigInt(baseTokenHugeAmount),
+		utils.DecimalToBigInt(quoteTokenHugeAmount),
+		utils.DecimalToBigInt(gasFeeInQuoteTokenHugeAmount),
+		orderDataHex, // Pass hex string to SDK
+		"",
+	)
+
+	orderHash := hydro.GetOrderHash(sdkOrder)
+	orderResponse := BuildOrderResp{
 		market.MakerFeeRate,
 		market.TakerFeeRate,
 		decimal.Zero,

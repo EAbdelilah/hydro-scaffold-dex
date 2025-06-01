@@ -42,6 +42,16 @@ func loadRoutes(e *echo.Echo) {
 	addRoute(e, "POST", "/orders", &PlaceOrderReq{}, PlaceOrder, authMiddleware)
 	addRoute(e, "DELETE", "/orders/:orderID", &CancelOrderReq{}, CancelOrder, authMiddleware)
 	addRoute(e, "GET", "/account/lockedBalances", &LockedBalanceReq{}, GetLockedBalance, authMiddleware)
+
+	// Margin Account Routes
+	addRoute(e, "GET", "/margin/accounts/:marketID", &MarginAccountDetailsReq{}, GetMarginAccountDetails, authMiddleware)
+	addRoute(e, "POST", "/margin/collateral/deposit", &CollateralManagementReq{}, DepositToCollateral, authMiddleware)
+	addRoute(e, "POST", "/margin/collateral/withdraw", &CollateralManagementReq{}, WithdrawFromCollateral, authMiddleware)
+
+	// Loan Management Routes
+	addRoute(e, "POST", "/margin/loans/borrow", &CollateralManagementReq{}, BorrowLoan, authMiddleware) // Reusing CollateralManagementReq for borrow
+	addRoute(e, "POST", "/margin/loans/repay", &CollateralManagementReq{}, RepayLoan, authMiddleware)    // Reusing CollateralManagementReq for repay
+	addRoute(e, "GET", "/margin/loans", &LoanListReq{}, GetLoans, authMiddleware)
 }
 
 func addRoute(e *echo.Echo, method, url string, param Param, handler func(p Param) (interface{}, error), middlewares ...echo.MiddlewareFunc) {
@@ -134,6 +144,13 @@ func StartServer(ctx context.Context, startMetric func()) {
 
 	// init blockchain
 	hydro = ethereum.NewEthereumHydro(os.Getenv("HSK_BLOCKCHAIN_RPC_URL"), os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS"))
+
+	// Init SDK Wrappers
+	// HSK_HYBRID_EXCHANGE_ADDRESS is used as the address for the core Hydro contract containing margin functions.
+	// This might need to be a different environment variable if the margin functionalities are in a separate contract.
+	if err := sdk_wrappers.InitHydroWrappers(os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS")); err != nil {
+		panic(fmt.Sprintf("Failed to initialize Hydro SDK Wrappers: %v", err))
+	}
 
 	//init database
 	models.Connect(os.Getenv("HSK_DATABASE_URL"))
