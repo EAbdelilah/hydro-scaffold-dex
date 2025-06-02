@@ -1,10 +1,10 @@
-import { fromJS, List } from 'immutable'; // Added List
+import { fromJS, List } from 'immutable';
 import {
   SELECT_ACCOUNT_TYPE,
   FETCH_MARGIN_ACCOUNT_DETAILS_REQUEST,
   FETCH_MARGIN_ACCOUNT_DETAILS_SUCCESS,
   FETCH_MARGIN_ACCOUNT_DETAILS_FAILURE,
-  DEPOSIT_COLLATERAL_REQUEST,
+  DEPOSIT_COLLATERAL_REQUEST, // Assuming these are handled for UI, though not explicitly part of this subtask's focus
   DEPOSIT_COLLATERAL_SUCCESS,
   DEPOSIT_COLLATERAL_FAILURE,
   WITHDRAW_COLLATERAL_REQUEST,
@@ -22,35 +22,64 @@ import {
   FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST,
   FETCH_SPENDABLE_MARGIN_BALANCE_SUCCESS,
   FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE,
-  HANDLE_MARGIN_ACCOUNT_UPDATE, // Imported new action type
-  HANDLE_MARGIN_ALERT,          // Imported new action type
-  DISMISS_MARGIN_ALERT          // Imported new action type
-  // HANDLE_AUCTION_UPDATE // Keep for future
+  FETCH_OPEN_POSITIONS_REQUEST,
+  FETCH_OPEN_POSITIONS_SUCCESS,
+  FETCH_OPEN_POSITIONS_FAILURE,
+  OPEN_MARGIN_POSITION_REQUEST,
+  OPEN_MARGIN_POSITION_UNSIGNED_TX_RECEIVED,
+  OPEN_MARGIN_POSITION_FAILURE,
+  SIGNING_MARGIN_TRANSACTION_PENDING,
+  SIGNING_MARGIN_TRANSACTION_COMPLETE,
+  BROADCAST_MARGIN_TRANSACTION_REQUEST,
+  BROADCAST_MARGIN_TRANSACTION_SUCCESS,
+  BROADCAST_MARGIN_TRANSACTION_FAILURE,
+  INITIATE_CLOSE_MARGIN_POSITION_REQUEST,
+  INITIATE_CLOSE_MARGIN_POSITION_UNSIGNED_TX_RECEIVED,
+  INITIATE_CLOSE_MARGIN_POSITION_FAILURE,
+  INITIATE_REPAY_LOAN_REQUEST, // New types for repay loan flow
+  INITIATE_REPAY_LOAN_UNSIGNED_TX_RECEIVED,
+  INITIATE_REPAY_LOAN_FAILURE,
+  HANDLE_MARGIN_ACCOUNT_UPDATE, 
+  HANDLE_MARGIN_ALERT,          
+  DISMISS_MARGIN_ALERT          
 } from '../actions/marginActions';
 
 const initialState = fromJS({
-  accountDetailsByMarket: {}, // Keyed by marketID. Stores MarginAccountDetailsResp for each market.
-  loansByMarket: {},          // Keyed by marketID. Stores array of loans for each market.
-  marginSpendableBalances: {}, // Keyed by marketID, then assetSymbol. Stores string amount.
-  // auctions: {}, // Future use for auction data, keyed by auctionID
+  accountDetailsByMarket: {}, 
+  loansByMarket: {},          
+  openPositions: {            
+    list: [],
+    isLoading: false,
+    error: null,
+  },
+  marginSpendableBalances: {}, 
+  unsignedMarginTx: null,      
+  lastMarginTxHash: null,      
   ui: {
-    selectedAccountType: 'spot', // "spot" or "margin" - global toggle for trading context
-
+    selectedAccountType: 'spot', 
     getMarginAccountDetailsLoading: {},
     getMarginAccountDetailsError: {},
-    getLoansLoading: {},
-    getLoansError: {},
-
+    getLoansLoading: {}, // This might be a map by marketID if fetchLoans is market-specific
+    getLoansError: {},   // This might be a map by marketID
+    fetchSpendableMarginBalanceLoading: {}, 
+    fetchSpendableMarginBalanceError: {},   
     depositCollateralLoading: false,
     depositCollateralError: null,
     withdrawCollateralLoading: false,
     withdrawCollateralError: null,
     borrowLoanLoading: false,
     borrowLoanError: null,
-    repayLoanLoading: false,
-    repayLoanError: null,
+    repayLoanLoading: false, // Original direct repay loading flag
+    repayLoanError: null,   // Original direct repay error flag
 
-    activeMarginAlerts: List(), // Initialize as an empty Immutable List
+    isOpeningMarginPosition: false, 
+    isClosingMarginPosition: false, 
+    isProcessingRepayLoan: false, // New specific flag for repaying loan
+    isSigningInWallet: false, 
+    isBroadcastingMarginTx: false,
+    marginActionError: null, 
+
+    activeMarginAlerts: List(), 
   }
 });
 
@@ -72,90 +101,39 @@ export default function marginReducer(state = initialState, action) {
         .setIn(['ui', 'getMarginAccountDetailsLoading', action.payload.marketID], false)
         .setIn(['ui', 'getMarginAccountDetailsError', action.payload.marketID], action.payload.error);
 
-    case FETCH_LOANS_REQUEST:
-      return state
-        .setIn(['ui', 'getLoansLoading', action.payload.marketID], true)
-        .setIn(['ui', 'getLoansError', action.payload.marketID], null);
-    case FETCH_LOANS_SUCCESS:
-      return state
-        .setIn(['ui', 'getLoansLoading', action.payload.marketID], false)
-        .setIn(['loansByMarket', action.payload.marketID], fromJS(action.payload.loans || { loans: [] }));
-    case FETCH_LOANS_FAILURE:
-      return state
-        .setIn(['ui', 'getLoansLoading', action.payload.marketID], false)
-        .setIn(['ui', 'getLoansError', action.payload.marketID], action.payload.error);
-
-    case DEPOSIT_COLLATERAL_REQUEST:
-      return state
-        .setIn(['ui', 'depositCollateralLoading'], true)
-        .setIn(['ui', 'depositCollateralError'], null);
-    case DEPOSIT_COLLATERAL_SUCCESS:
-      return state.setIn(['ui', 'depositCollateralLoading'], false);
-    case DEPOSIT_COLLATERAL_FAILURE:
-      return state
-        .setIn(['ui', 'depositCollateralLoading'], false)
-        .setIn(['ui', 'depositCollateralError'], action.payload.error);
-
-    case WITHDRAW_COLLATERAL_REQUEST:
-      return state
-        .setIn(['ui', 'withdrawCollateralLoading'], true)
-        .setIn(['ui', 'withdrawCollateralError'], null);
-    case WITHDRAW_COLLATERAL_SUCCESS:
-      return state.setIn(['ui', 'withdrawCollateralLoading'], false);
-    case WITHDRAW_COLLATERAL_FAILURE:
-      return state
-        .setIn(['ui', 'withdrawCollateralLoading'], false)
-        .setIn(['ui', 'withdrawCollateralError'], action.payload.error);
-
-    case BORROW_LOAN_REQUEST:
-      return state
-        .setIn(['ui', 'borrowLoanLoading'], true)
-        .setIn(['ui', 'borrowLoanError'], null);
-    case BORROW_LOAN_SUCCESS:
-      return state.setIn(['ui', 'borrowLoanLoading'], false);
-    case BORROW_LOAN_FAILURE:
-      return state
-        .setIn(['ui', 'borrowLoanLoading'], false)
-        .setIn(['ui', 'borrowLoanError'], action.payload.error);
-
-    case REPAY_LOAN_REQUEST:
-      return state
-        .setIn(['ui', 'repayLoanLoading'], true)
-        .setIn(['ui', 'repayLoanError'], null);
-    case REPAY_LOAN_SUCCESS:
-      return state.setIn(['ui', 'repayLoanLoading'], false);
-    case REPAY_LOAN_FAILURE:
-      return state
-        .setIn(['ui', 'repayLoanLoading'], false)
-        .setIn(['ui', 'repayLoanError'], action.payload.error);
-
-    // Cases for WebSocket updates
-    case HANDLE_MARGIN_ACCOUNT_UPDATE:
-      if (action.payload && action.payload.marketID) {
-        // Assuming payload is the full new details for that market for the current user.
-        // This will overwrite existing details for that market.
-        // If payload also contains loan updates, they should be part of this payload
-        // or handled by a separate WebSocket message type.
-        // For example, if action.payload also has a 'loans' field:
-        // let newState = state.mergeIn(['accountDetailsByMarket', action.payload.marketID], fromJS(action.payload));
-        // if (action.payload.loans) { // Assuming loans are nested under the account update for that market
-        //    newState = newState.setIn(['loansByMarket', action.payload.marketID, 'loans'], fromJS(action.payload.loans));
-        // }
-        // return newState;
-        // For now, just updating accountDetailsByMarket based on the prompt
-        return state.mergeIn(['accountDetailsByMarket', action.payload.marketID], fromJS(action.payload));
+    case FETCH_LOANS_REQUEST: // Assuming fetchLoans can be general or market specific
+      let loadingPath = action.payload.marketID 
+        ? ['ui', 'getLoansLoading', action.payload.marketID] 
+        : ['ui', 'getLoansLoading', 'all']; // Example for a global flag
+      let errorPath = action.payload.marketID
+        ? ['ui', 'getLoansError', action.payload.marketID]
+        : ['ui', 'getLoansError', 'all'];
+      return state.setIn(loadingPath, true).setIn(errorPath, null);
+    case FETCH_LOANS_SUCCESS: // Stores loans by marketID even if fetched all
+      let successLoadingPath = action.payload.marketID 
+        ? ['ui', 'getLoansLoading', action.payload.marketID] 
+        : ['ui', 'getLoansLoading', 'all'];
+      if (action.payload.marketID) { // Specific market update
+        return state
+          .setIn(successLoadingPath, false)
+          .setIn(['loansByMarket', action.payload.marketID], fromJS(action.payload.loans || { loans: [] }));
+      } else { // If it was a fetch for all loans, the payload should be structured accordingly
+        // This part depends on how "fetch all loans" structures its payload.
+        // For now, assuming it still comes per market or the reducer is updated if payload is a flat list.
+        // If payload.loans is a map of marketID -> loansData:
+        // return state.setIn(successLoadingPath, false).mergeIn(['loansByMarket'], fromJS(action.payload.loansByMarket));
+        console.warn("FETCH_LOANS_SUCCESS without marketID not fully handled for 'all loans' scenario yet.");
+        return state.setIn(successLoadingPath, false);
       }
-      return state;
+    case FETCH_LOANS_FAILURE:
+      let failureLoadingPath = action.payload.marketID 
+      ? ['ui', 'getLoansLoading', action.payload.marketID] 
+      : ['ui', 'getLoansLoading', 'all'];
+      let failureErrorPath = action.payload.marketID
+        ? ['ui', 'getLoansError', action.payload.marketID]
+        : ['ui', 'getLoansError', 'all'];
+      return state.setIn(failureLoadingPath, false).setIn(failureErrorPath, action.payload.error);
 
-    case HANDLE_MARGIN_ALERT:
-      // Pushes a new alert object (already given an ID in action creator) to the list
-      return state.updateIn(['ui', 'activeMarginAlerts'], alerts => alerts.push(fromJS(action.payload)));
-
-    case DISMISS_MARGIN_ALERT:
-      // Filters out the alert with the given ID
-      return state.updateIn(['ui', 'activeMarginAlerts'], alerts =>
-        alerts.filter(alert => alert.get('id') !== action.payload.alertId)
-      );
 
     case FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST:
       return state
@@ -170,12 +148,112 @@ export default function marginReducer(state = initialState, action) {
         .setIn(['ui', 'fetchSpendableMarginBalanceLoading', action.payload.marketID, action.payload.assetSymbol], false)
         .setIn(['ui', 'fetchSpendableMarginBalanceError', action.payload.marketID, action.payload.assetSymbol], action.payload.error);
 
-    // case HANDLE_AUCTION_UPDATE: // Future use
-    //   if (action.payload && action.payload.auctionID) {
-    //     if (!state.has('auctions')) { state = state.set('auctions', fromJS({})); }
-    //     return state.setIn(['auctions', action.payload.auctionID], fromJS(action.payload));
-    //   }
-    //   return state;
+    case FETCH_OPEN_POSITIONS_REQUEST:
+      return state
+        .setIn(['openPositions', 'isLoading'], true)
+        .setIn(['openPositions', 'error'], null);
+    case FETCH_OPEN_POSITIONS_SUCCESS:
+      return state
+        .setIn(['openPositions', 'isLoading'], false)
+        .setIn(['openPositions', 'list'], fromJS(action.payload.positions || []));
+    case FETCH_OPEN_POSITIONS_FAILURE:
+      return state
+        .setIn(['openPositions', 'isLoading'], false)
+        .setIn(['openPositions', 'error'], action.payload.error);
+    
+    case OPEN_MARGIN_POSITION_REQUEST:
+      return state
+        .setIn(['ui', 'isOpeningMarginPosition'], true)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false); 
+    case OPEN_MARGIN_POSITION_UNSIGNED_TX_RECEIVED:
+      return state
+        .setIn(['ui', 'isOpeningMarginPosition'], false) 
+        .set('unsignedMarginTx', fromJS(action.payload)); 
+    case OPEN_MARGIN_POSITION_FAILURE:
+      return state
+        .setIn(['ui', 'isOpeningMarginPosition'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    case INITIATE_CLOSE_MARGIN_POSITION_REQUEST:
+      return state
+        .setIn(['ui', 'isClosingMarginPosition'], true)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false);
+    case INITIATE_CLOSE_MARGIN_POSITION_UNSIGNED_TX_RECEIVED:
+      return state
+        .setIn(['ui', 'isClosingMarginPosition'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
+    case INITIATE_CLOSE_MARGIN_POSITION_FAILURE:
+      return state
+        .setIn(['ui', 'isClosingMarginPosition'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    case INITIATE_REPAY_LOAN_REQUEST:
+      return state
+        .setIn(['ui', 'isProcessingRepayLoan'], true)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false);
+    case INITIATE_REPAY_LOAN_UNSIGNED_TX_RECEIVED:
+      return state
+        .setIn(['ui', 'isProcessingRepayLoan'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
+    case INITIATE_REPAY_LOAN_FAILURE:
+      return state
+        .setIn(['ui', 'isProcessingRepayLoan'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    case SIGNING_MARGIN_TRANSACTION_PENDING:
+      return state
+        .setIn(['ui', 'isSigningInWallet'], true)
+        .setIn(['ui', 'marginActionError'], null); 
+    case SIGNING_MARGIN_TRANSACTION_COMPLETE: 
+      return state.setIn(['ui', 'isSigningInWallet'], false);
+
+    case BROADCAST_MARGIN_TRANSACTION_REQUEST:
+      return state
+        .setIn(['ui', 'isBroadcastingMarginTx'], true)
+        .setIn(['ui', 'isSigningInWallet'], false) 
+        .setIn(['ui', 'marginActionError'], null);
+    case BROADCAST_MARGIN_TRANSACTION_SUCCESS:
+      return state
+        .setIn(['ui', 'isBroadcastingMarginTx'], false)
+        .set('lastMarginTxHash', action.payload.transactionHash)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'isOpeningMarginPosition'], false) 
+        .setIn(['ui', 'isClosingMarginPosition'], false)
+        .setIn(['ui', 'isProcessingRepayLoan'], false); // Reset this too
+    case BROADCAST_MARGIN_TRANSACTION_FAILURE:
+      return state
+        .setIn(['ui', 'isBroadcastingMarginTx'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null) 
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'isOpeningMarginPosition'], false) 
+        .setIn(['ui', 'isClosingMarginPosition'], false)
+        .setIn(['ui', 'isProcessingRepayLoan'], false); // Reset this too
+
+    case HANDLE_MARGIN_ACCOUNT_UPDATE:
+      if (action.payload && action.payload.marketID) {
+        return state.mergeIn(['accountDetailsByMarket', action.payload.marketID], fromJS(action.payload));
+      }
+      return state;
+    case HANDLE_MARGIN_ALERT:
+      return state.updateIn(['ui', 'activeMarginAlerts'], alerts => alerts.push(fromJS(action.payload)));
+    case DISMISS_MARGIN_ALERT:
+      return state.updateIn(['ui', 'activeMarginAlerts'], alerts =>
+        alerts.filter(alert => alert.get('id') !== action.payload.alertId)
+      );
 
     default:
       return state;

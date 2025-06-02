@@ -218,3 +218,53 @@ export const getActionError = (actionPrefix) => createSelector(
   getMarginState,
   marginState => marginState.getIn(['ui', `${actionPrefix}Error`], null)
 );
+
+// --- Open Positions Selectors ---
+export const getOpenPositionsState = createSelector(
+  getMarginState,
+  marginState => marginState.get('openPositions', Map({ list: List(), isLoading: false, error: null }))
+);
+
+export const getOpenPositionsList = createSelector(
+  getOpenPositionsState,
+  openPositionsState => openPositionsState.get('list', List())
+);
+
+export const getOpenPositionsLoading = createSelector(
+  getOpenPositionsState,
+  openPositionsState => openPositionsState.get('isLoading', false)
+);
+
+export const getOpenPositionsError = createSelector(
+  getOpenPositionsState,
+  openPositionsState => openPositionsState.get('error', null)
+);
+
+// --- Active Loans Selectors (can be enhanced or used with getLoansForMarket) ---
+// getLoansForMarket (already exists) is good for market-specific views.
+// For a global list of all active loans for a user across all markets:
+export const getAllActiveLoansList = createSelector(
+  getLoansByMarketMap, // Existing selector: returns Map({ marketID1: {loans: List(...) }, marketID2: ... })
+  (loansByMarketMap) => {
+    let allLoans = List();
+    loansByMarketMap.forEach(marketLoansData => {
+      // marketLoansData is expected to be a Map with a 'loans' key holding a List
+      const loansInMarket = marketLoansData.get('loans', List());
+      allLoans = allLoans.concat(loansInMarket);
+    });
+    return allLoans;
+  }
+);
+
+// General loading state for any loan fetching (if needed, or use market-specific getLoansLoading)
+// This might need a more sophisticated way to determine if *any* loan fetching is in progress
+// if fetchLoans is always market-specific. For now, this is a conceptual placeholder.
+// A simpler approach is that the component using this would iterate markets and use getLoansLoading for each.
+// However, if there was a global "fetch all loans" action, this would be its loading state.
+export const getAnyLoanLoadingState = createSelector(
+    getMarginState,
+    marginState => {
+        const loansLoadingMap = marginState.getIn(['ui', 'getLoansLoading'], Map());
+        return loansLoadingMap.some(isLoading => isLoading === true);
+    }
+);

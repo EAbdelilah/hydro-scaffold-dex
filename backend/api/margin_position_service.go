@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strings" 
+	"time"   
 
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/models"
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers"
@@ -15,15 +17,34 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// Helper function to get asset price in USD
+func getPriceUSD(hydroSDK sdk.Hydro, assetAddress goEthereumCommon.Address, assetSymbol string) (decimal.Decimal, error) {
+	assetInfo, err := sdk_wrappers.GetAsset(hydroSDK, assetAddress) 
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("failed to get asset contract info for %s (%s): %v", assetSymbol, assetAddress.Hex(), err)
+	}
+	if assetInfo.PriceOracle == (goEthereumCommon.Address{}) { 
+		return decimal.Zero, fmt.Errorf("no price oracle configured for asset %s (%s)", assetSymbol, assetAddress.Hex())
+	}
+
+	priceBigInt, err := sdk_wrappers.GetOraclePrice(hydroSDK, assetInfo.PriceOracle, assetAddress)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("failed to get oracle price for %s (%s) from oracle %s: %v", assetSymbol, assetAddress.Hex(), assetInfo.PriceOracle.Hex(), err)
+	}
+	// Assuming oracle prices are returned with 18 decimals for USD value
+	return utils.BigIntToDecimal(priceBigInt, 18), nil
+}
+
+
 // OpenMarginPositionReq defines the request structure for opening a margin position.
 type OpenMarginPositionReq struct {
-	MarketID            string  `json:"marketID" validate:"required"`                     // e.g., "HOT-ETH"
-	Side                string  `json:"side" validate:"required,oneof=buy sell"`          // "buy" or "sell"
-	Amount              string  `json:"amount" validate:"required,numeric"`               // Amount of base asset to buy/sell
-	Price               string  `json:"price" validate:"omitempty,numeric"`               // Optional, for limit orders
-	Leverage            float64 `json:"leverage" validate:"required,gt=0"`                // e.g., 2.5 for 2.5x leverage
-	CollateralAssetSymbol string  `json:"collateralAssetSymbol" validate:"required"`      // e.g., "ETH" or "DAI"
-	CollateralAmount    string  `json:"collateralAmount" validate:"required,numeric"`     // Amount of collateral to use from common balance
+	MarketID            string  `json:"marketID" validate:"required"`                     
+	Side                string  `json:"side" validate:"required,oneof=buy sell"`          
+	Amount              string  `json:"amount" validate:"required,numeric"`               
+	Price               string  `json:"price" validate:"required,numeric"`               
+	Leverage            float64 `json:"leverage" validate:"required,gt=0"`                
+	CollateralAssetSymbol string  `json:"collateralAssetSymbol" validate:"required"`      
+	CollateralAmount    string  `json:"collateralAmount" validate:"required,numeric"`     
 }
 
 // OpenMarginPosition handles the request to open a new margin position.
@@ -35,72 +56,154 @@ func OpenMarginPosition(c echo.Context) error {
 
 	cc := c.(*CustomContext)
 	userAddress := goEthereumCommon.HexToAddress(cc.Get("userAddress").(string))
-	market, err := models.MarketDao.FindMarketByID(req.MarketID)
+	marketFromDB, err := models.MarketDao.FindMarketByID(req.MarketID)
 	if err != nil {
 		return NewError(http.StatusNotFound, fmt.Sprintf("Market %s not found", req.MarketID))
 	}
-
-	collateralAmountDecimal, err := decimal.NewFromString(req.CollateralAmount)
-	if err != nil {
-		return NewError(http.StatusBadRequest, fmt.Sprintf("Invalid collateral amount: %s", req.CollateralAmount))
+	if !marketFromDB.BorrowEnable {
+		return NewError(http.StatusBadRequest, fmt.Sprintf("Margin trading is not enabled for market %s", req.MarketID))
 	}
 
-	// TODO: Convert other string amounts/prices (req.Amount, req.Price) to decimal.Decimal or *big.Int as needed.
+	hydroSDK := GetHydroSDK() 
+	if hydroSDK == nil {
+		return NewError(http.StatusInternalServerError, "Hydro SDK not available")
+	}
 
-	// --- Placeholder for Pre-trade Validations ---
-	// 1. Fetch user's collateral asset balance (e.g., req.CollateralAssetSymbol) from their common balance.
-	//    - This might involve a call to an ERC20 wrapper or another SDK function.
-	//    - Example: collateralToken, err := models.TokenDao.GetTokenBySymbol(req.CollateralAssetSymbol)
-	//    - Example: commonBalance, err := sdk_wrappers.GetERC20Balance(userAddress, collateralToken.Address)
-	//    - If commonBalance < collateralAmountDecimal, return error.
-	utils.Info("Placeholder: Fetch user's collateral asset balance for %s", req.CollateralAssetSymbol)
+	// --- Convert Request Strings to Decimal ---
+	amountDecimal, err := decimal.NewFromString(req.Amount)
+	if err != nil { return NewError(http.StatusBadRequest, fmt.Sprintf("Invalid amount: %s", req.Amount)) }
+	
+	priceDecimal, err := decimal.NewFromString(req.Price) 
+	if err != nil { return NewError(http.StatusBadRequest, fmt.Sprintf("Invalid price: %s", req.Price)) }
+	
+	collateralAmountDecimal, err := decimal.NewFromString(req.CollateralAmount)
+	if err != nil { return NewError(http.StatusBadRequest, fmt.Sprintf("Invalid collateralAmount: %s", req.CollateralAmount)) }
+	
+	leverageDecimal := decimal.NewFromFloat(req.Leverage)
 
-	// 2. Fetch market margin parameters (IMR, MMR, LiquidateRate) for market.ID (uint16).
-	//    - This will require a new function in sdk_wrappers, e.g., `sdk_wrappers.GetMarketMarginParameters(market.ID)`
-	//    - These parameters are crucial for margin calculations.
-	utils.Info("Placeholder: Fetch market margin parameters for market ID %d", market.ID)
-	//    - Example: marketParams, err := sdk_wrappers.GetMarketMarginParameters(hydroSDK, market.ID) (assuming hydroSDK is available)
+	if amountDecimal.IsNegativeOrZero() || priceDecimal.IsNegativeOrZero() || collateralAmountDecimal.IsNegativeOrZero() {
+		return NewError(http.StatusBadRequest, "Amount, price, and collateral amount must be positive.")
+	}
+	if leverageDecimal.LessThanOrEqual(decimal.NewFromInt(1)) { 
+		return NewError(http.StatusBadRequest, "Leverage must be greater than 1.")
+	}
+	
+	// --- Fetch Market Margin Parameters ---
+	// Using DB market model for IMR/LiquidateRate.
+	// sdk_wrappers.GetMarketMarginParameters is a placeholder and would be preferred if it fetched live on-chain data.
+	marketParams, err := sdk_wrappers.GetMarketMarginParameters(hydroSDK, marketFromDB.ID_uint16())
+	if err != nil {
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get market margin parameters for %s: %v", marketFromDB.ID, err))
+	}
+	// Override with DB values if they are considered more authoritative or if SDK returns defaults
+	imrFraction_dec := marketFromDB.InitialMarginFraction 
+	liquidateRate_dec := marketFromDB.LiquidateRate
+	if marketFromDB.InitialMarginFraction.IsZero() { // If DB value is not set, use the (mocked) SDK one
+	    imrFraction_dec = marketParams.InitialMarginFraction
+	}
+    if marketFromDB.LiquidateRate.IsZero() { // If DB value is not set, use the (mocked) SDK one
+	    liquidateRate_dec = marketParams.LiquidateRate
+	}
 
-	// 3. Calculate required initial margin based on order size, price, leverage, and market's IMR.
-	//    - PositionValue = Amount * Price (if limit) or estimated market price.
-	//    - RequiredInitialMargin = PositionValue / Leverage * IMR_factor (or similar logic from contract/docs)
-	//    - Check if req.CollateralAmount >= RequiredInitialMargin.
-	utils.Info("Placeholder: Calculate required initial margin and check against user's provided collateral and leverage.")
+	if imrFraction_dec.LessThanOrEqual(decimal.Zero) || imrFraction_dec.GreaterThanOrEqual(decimal.NewFromInt(1)) {
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Market %s has invalid InitialMarginFraction: %s", marketFromDB.ID, imrFraction_dec.String()))
+	}
+	if liquidateRate_dec.LessThanOrEqual(decimal.NewFromInt(1)) { 
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Market %s has invalid LiquidateRate: %s", marketFromDB.ID, liquidateRate_dec.String()))
+	}
+	
 
-	// 4. Estimate post-trade account health (e.g., using `sdk_wrappers.GetAccountDetails`).
-	//    - This is complex as it requires simulating the state *after* the batch actions.
-	//    - For now, we might skip this or do a very rough estimation.
-	//    - If estimated post-trade status is liquidatable, reject.
-	utils.Info("Placeholder: Estimate post-trade account health.")
+	// --- Fetch User's Collateral Asset Balance (Common Wallet) ---
+	collateralToken, err := models.TokenDao.GetTokenBySymbol(req.CollateralAssetSymbol)
+	if err != nil {
+		return NewError(http.StatusBadRequest, fmt.Sprintf("Collateral asset %s not found or supported", req.CollateralAssetSymbol))
+	}
+	collateralAssetAddress := goEthereumCommon.HexToAddress(collateralToken.Address)
+	
+	userCollateralAvailableInWallet, err := sdk_wrappers.BalanceOf(hydroSDK, collateralAssetAddress, userAddress)
+	if err != nil {
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to fetch wallet balance for %s: %v", req.CollateralAssetSymbol, err))
+	}
+	if userCollateralAvailableInWallet.LessThan(collateralAmountDecimal) {
+		return NewError(http.StatusBadRequest, fmt.Sprintf("Insufficient common balance of %s for specified collateral. Available: %s, Required: %s",
+			req.CollateralAssetSymbol, userCollateralAvailableInWallet.StringFixed(collateralToken.Decimals), collateralAmountDecimal.StringFixed(collateralToken.Decimals)))
+	}
+
+	// --- Fetch Current Margin Account State ---
+	currentAccountDetails, err := sdk_wrappers.GetAccountDetails(hydroSDK, userAddress, marketFromDB.ID_uint16())
+	if err != nil {
+		utils.Warningf("OpenMarginPosition: Could not fetch current account details for user %s, market %s (may be new account): %v", userAddress.Hex(), marketFromDB.ID, err)
+		currentAccountDetails = &sdk_wrappers.SDKAccountDetails{ 
+			AssetsTotalUSDValue: big.NewInt(0),
+			DebtsTotalUSDValue:  big.NewInt(0),
+			Status:              0, 
+			Liquidatable:        false,
+		}
+	}
+	currentAssetsUSD_dec := utils.BigIntToDecimal(currentAccountDetails.AssetsTotalUSDValue, 18) 
+	currentDebtsUSD_dec := utils.BigIntToDecimal(currentAccountDetails.DebtsTotalUSDValue, 18)
+
+	// --- Calculations for Validation ---
+	equityContributionDecimal := collateralAmountDecimal
+	
+	collateralAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, collateralAssetAddress, collateralToken.Symbol)
+	if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for collateral asset %s: %v", req.CollateralAssetSymbol, err)) }
+	if collateralAssetPriceUSD_dec.IsZero() {
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Oracle price for collateral asset %s is zero. Cannot perform USD calculations.", req.CollateralAssetSymbol))
+	}
+	equityContributionUSD_dec := equityContributionDecimal.Mul(collateralAssetPriceUSD_dec)
+
+	// Simplified Borrow Amount Calculation (in USD terms) for validation
+	borrowAmountUSD_dec := equityContributionUSD_dec.Mul(leverageDecimal.Sub(decimal.NewFromInt(1)))
+	if borrowAmountUSD_dec.IsNegative() { borrowAmountUSD_dec = decimal.Zero }
+	
+	// --- Projected Account State for Validation ---
+	projectedAssetsTotalUSD_dec := currentAssetsUSD_dec.Add(equityContributionUSD_dec).Add(borrowAmountUSD_dec)
+	projectedDebtsTotalUSD_dec := currentDebtsUSD_dec.Add(borrowAmountUSD_dec)
+	
+	var projectedMarginRatio_dec decimal.Decimal
+	if projectedDebtsTotalUSD_dec.IsPositive() {
+		projectedMarginRatio_dec = projectedAssetsTotalUSD_dec.Div(projectedDebtsTotalUSD_dec)
+	} else if projectedAssetsTotalUSD_dec.IsPositive() { 
+		projectedMarginRatio_dec = decimal.NewFromInt(999999) 
+	} else { 
+		projectedMarginRatio_dec = decimal.NewFromInt(999999) 
+	}
+	utils.Infof("Pre-Trade Check for user %s, market %s: Requested Leverage: %s. Collateral Added (USD): %s. Borrowed (USD estimate): %s. Projected Assets USD: %s, Projected Debts USD: %s, Projected Margin Ratio: %s",
+		userAddress.Hex(), marketFromDB.ID, req.Leverage, equityContributionUSD_dec.StringFixed(2), borrowAmountUSD_dec.StringFixed(2), projectedAssetsTotalUSD_dec.StringFixed(2), projectedDebtsTotalUSD_dec.StringFixed(2), projectedMarginRatio_dec.StringFixed(4))
+
+	// --- Initial Margin Requirement (IMR) Check ---
+	minInitialMarginRatio_dec := decimal.NewFromInt(1).Div(decimal.NewFromInt(1).Sub(imrFraction_dec))
+	if projectedMarginRatio_dec.LessThan(minInitialMarginRatio_dec) {
+		return NewError(http.StatusBadRequest, fmt.Sprintf("Projected margin ratio %s%% is below initial requirement %s%%. Reduce leverage or increase collateral.",
+			projectedMarginRatio_dec.Mul(decimal.NewFromInt(100)).StringFixed(2), minInitialMarginRatio_dec.Mul(decimal.NewFromInt(100)).StringFixed(2)))
+	}
+
+	// --- Liquidation Rate Check ---
+	if projectedMarginRatio_dec.LessThan(liquidateRate_dec) {
+		return NewError(http.StatusBadRequest, fmt.Sprintf("Projected margin ratio %s%% is below liquidation rate %s%%. Trade would be instantly liquidated.",
+			projectedMarginRatio_dec.Mul(decimal.NewFromInt(100)).StringFixed(2), liquidateRate_dec.Mul(decimal.NewFromInt(100)).StringFixed(2)))
+	}
+
+	utils.Info("Pre-trade validations passed for OpenMarginPosition.")
 	// --- End of Pre-trade Validations ---
-
 
 	// --- Prepare SDKBatchAction array ---
 	var actions []sdk_wrappers.SDKBatchAction
 
 	// Action 1: Transfer Collateral
-	// Determine collateral token address
-	collateralToken, err := models.TokenDao.GetTokenBySymbol(req.CollateralAssetSymbol)
-	if err != nil {
-		return NewError(http.StatusBadRequest, fmt.Sprintf("Collateral asset %s not found or supported", req.CollateralAssetSymbol))
-	}
-	collateralTokenAddress := goEthereumCommon.HexToAddress(collateralToken.Address)
-
-	// Convert collateralAmountDecimal to *big.Int based on collateral token decimals
 	collateralAmountBigInt := utils.DecimalToBigInt(collateralAmountDecimal, int32(collateralToken.Decimals))
-
 	fromPath := sdk_wrappers.SDKBalancePath{
 		Category: sdk_wrappers.SDKBalanceCategoryCommon,
-		MarketID: 0, // Not applicable for common balance path
+		MarketID: 0, 
 		User:     userAddress,
 	}
 	toPath := sdk_wrappers.SDKBalancePath{
 		Category: sdk_wrappers.SDKBalanceCategoryCollateralAccount,
-		MarketID: market.ID, // Target market for the margin account
+		MarketID: marketFromDB.ID_uint16(), 
 		User:     userAddress,
 	}
-
-	encodedTransferParams, err := sdk_wrappers.EncodeTransferParamsForBatch(collateralTokenAddress, fromPath, toPath, collateralAmountBigInt)
+	encodedTransferParams, err := sdk_wrappers.EncodeTransferParamsForBatch(collateralAssetAddress, fromPath, toPath, collateralAmountBigInt)
 	if err != nil {
 		utils.Errorf("Failed to encode transfer params for batch: %v", err)
 		return NewError(http.StatusInternalServerError, "Failed to prepare collateral transfer action")
@@ -109,93 +212,93 @@ func OpenMarginPosition(c echo.Context) error {
 		ActionType:    sdk_wrappers.SDKActionTypeTransfer,
 		EncodedParams: encodedTransferParams,
 	})
-	utils.Info("Prepared Action 1: Transfer Collateral (%s %s) for market %d", req.CollateralAmount, req.CollateralAssetSymbol, market.ID)
-
+	utils.Info("Prepared Action 1: Transfer Collateral (%s %s) for market %s", req.CollateralAmount, req.CollateralAssetSymbol, marketFromDB.ID)
 
 	// Action 2: Borrow Asset
-	// TODO: Determine borrow asset (base or quote of req.MarketID) and borrow amount.
-	// This calculation is non-trivial:
-	// - If buying base (e.g., HOT in HOT-ETH), borrowing quote (ETH).
-	// - If selling base (e.g., HOT in HOT-ETH), borrowing base (HOT).
-	// - BorrowAmount = (PositionValue * (Leverage - 1) / Leverage) / BorrowAssetPrice
-	// - This requires knowing the price of the borrow asset and the main asset of the trade.
-	// For now, using placeholder values.
+	// TODO: This is where the precise borrow amount calculation is CRITICAL.
+	// The `borrowAmountUSD_dec` used in validation is an estimate.
+	// The actual amount to borrow in terms of base/quote asset needs to be calculated here.
 	var borrowAssetAddress goEthereumCommon.Address
 	var borrowAmountBigInt *big.Int
+	var borrowedAssetToken *models.Token
 
-	amountDecimal, _ := decimal.NewFromString(req.Amount) // Assume valid for now
-	// Example: If buying HOT-ETH, amount is HOT, price is ETH/HOT. Position value in ETH = amount * price.
-	// Collateral is req.CollateralAmount (e.g. in ETH).
-	// Total position value desired = collateralAmountDecimal * req.Leverage (in terms of collateral value)
-	// Amount to borrow = Total position value desired - collateralAmountDecimal (in terms of collateral value)
-	// This borrowed amount then needs to be converted to the borrow asset quantity.
+	positionBaseAmountDecimal := amountDecimal
+	positionQuoteValueDecimal := positionBaseAmountDecimal.Mul(priceDecimal)
 
-	if req.Side == "buy" { // Buying base asset, so borrowing quote asset
-		borrowAssetAddress = goEthereumCommon.HexToAddress(market.QuoteTokenAddress)
-		// Placeholder: Borrow 0.1 of quote asset
-		quoteToken, _ := models.TokenDao.GetTokenByAddress(market.QuoteTokenAddress)
-		borrowAmountBigInt = utils.DecimalToBigInt(decimal.NewFromFloat(0.1), int32(quoteToken.Decimals))
-		utils.Info("Placeholder: Determined borrow asset: %s (Quote), amount: 0.1", market.QuoteTokenSymbol)
+	if req.Side == "buy" { 
+		borrowAssetAddress = goEthereumCommon.HexToAddress(marketFromDB.QuoteTokenAddress)
+		borrowedAssetToken, _ = models.TokenDao.GetTokenByAddress(marketFromDB.QuoteTokenAddress)
+		if borrowedAssetToken == nil { return NewError(http.StatusInternalServerError, "Could not find quote token details for borrow.")}
+		
+		var equityInQuoteTokenDecimal decimal.Decimal
+		if collateralAssetAddress == borrowAssetAddress { 
+			equityInQuoteTokenDecimal = equityContributionDecimal
+		} else { 
+			// Collateral is Base, convert its value to Quote. Requires baseAssetPriceUSD.
+			baseAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, goEthereumCommon.HexToAddress(marketFromDB.BaseTokenAddress), marketFromDB.BaseTokenSymbol)
+			if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for base asset %s: %v", marketFromDB.BaseTokenSymbol, err)) }
+			if priceDecimal.IsZero() {return NewError(http.StatusInternalServerError, "Base asset price cannot be zero for this calculation.")} // Should use quote price from oracle
+            quoteAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, goEthereumCommon.HexToAddress(marketFromDB.QuoteTokenAddress), marketFromDB.QuoteTokenSymbol)
+            if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for quote asset %s: %v", marketFromDB.QuoteTokenSymbol, err)) }
+            if quoteAssetPriceUSD_dec.IsZero() { return NewError(http.StatusInternalServerError, "Quote asset price is zero, cannot convert collateral value.")}
+
+			equityInQuoteTokenDecimal = equityContributionDecimal.Mul(baseAssetPriceUSD_dec).Div(quoteAssetPriceUSD_dec)
+		}
+		borrowAmountQuoteDecimal := positionQuoteValueDecimal.Sub(equityInQuoteTokenDecimal)
+		if borrowAmountQuoteDecimal.LessThanOrEqual(decimal.Zero) { // If leverage is 1x or collateral covers full position
+		    utils.Info("Calculated zero or negative borrow amount for quote asset. No borrow action needed for this asset.")
+		    borrowAmountBigInt = big.NewInt(0)
+		} else {
+			borrowAmountBigInt = utils.DecimalToBigInt(borrowAmountQuoteDecimal, int32(borrowedAssetToken.Decimals))
+			utils.Infof("Calculated Borrow: Quote Asset %s, Amount %s", borrowedAssetToken.Symbol, borrowAmountQuoteDecimal.StringFixed(borrowedAssetToken.Decimals))
+		}
 	} else { // Selling base asset, so borrowing base asset
-		borrowAssetAddress = goEthereumCommon.HexToAddress(market.BaseTokenAddress)
-		// Placeholder: Borrow 10 of base asset
-		baseToken, _ := models.TokenDao.GetTokenByAddress(market.BaseTokenAddress)
-		borrowAmountBigInt = utils.DecimalToBigInt(decimal.NewFromFloat(10), int32(baseToken.Decimals))
-		utils.Info("Placeholder: Determined borrow asset: %s (Base), amount: 10", market.BaseTokenSymbol)
-	}
-	// Actual calculation needs to be implemented carefully.
+		borrowAssetAddress = goEthereumCommon.HexToAddress(marketFromDB.BaseTokenAddress)
+		borrowedAssetToken, _ = models.TokenDao.GetTokenByAddress(marketFromDB.BaseTokenAddress)
+		if borrowedAssetToken == nil { return NewError(http.StatusInternalServerError, "Could not find base token details for borrow.")}
 
-
-	encodedBorrowParams, err := sdk_wrappers.EncodeBorrowParamsForBatch(market.ID, borrowAssetAddress, borrowAmountBigInt)
-	if err != nil {
-		utils.Errorf("Failed to encode borrow params for batch: %v", err)
-		return NewError(http.StatusInternalServerError, "Failed to prepare borrow action")
+		var equityInBaseTokenDecimal decimal.Decimal
+		if collateralAssetAddress == borrowAssetAddress { 
+			equityInBaseTokenDecimal = equityContributionDecimal
+		} else { // Collateral is Quote, convert its value to Base terms.
+			if priceDecimal.IsZero() { return NewError(http.StatusBadRequest, "Price cannot be zero for this calculation.")}
+			equityInBaseTokenDecimal = equityContributionDecimal.Div(priceDecimal) 
+		}
+		borrowAmountBaseDecimal := positionBaseAmountDecimal.Sub(equityInBaseTokenDecimal)
+		if borrowAmountBaseDecimal.LessThanOrEqual(decimal.Zero) {
+			utils.Info("Calculated zero or negative borrow amount for base asset. No borrow action needed for this asset.")
+			borrowAmountBigInt = big.NewInt(0)
+		} else {
+			borrowAmountBigInt = utils.DecimalToBigInt(borrowAmountBaseDecimal, int32(borrowedAssetToken.Decimals))
+			utils.Infof("Calculated Borrow: Base Asset %s, Amount %s", borrowedAssetToken.Symbol, borrowAmountBaseDecimal.StringFixed(borrowedAssetToken.Decimals))
+		}
 	}
-	actions = append(actions, sdk_wrappers.SDKBatchAction{
-		ActionType:    sdk_wrappers.SDKActionTypeBorrow,
-		EncodedParams: encodedBorrowParams,
-	})
-	utils.Info("Prepared Action 2: Borrow Asset (placeholder amount)")
+	
+	if borrowAmountBigInt != nil && borrowAmountBigInt.Sign() > 0 {
+		encodedBorrowParams, err := sdk_wrappers.EncodeBorrowParamsForBatch(marketFromDB.ID_uint16(), borrowAssetAddress, borrowAmountBigInt)
+		if err != nil {
+			utils.Errorf("Failed to encode borrow params for batch: %v", err)
+			return NewError(http.StatusInternalServerError, "Failed to prepare borrow action")
+		}
+		actions = append(actions, sdk_wrappers.SDKBatchAction{
+			ActionType:    sdk_wrappers.SDKActionTypeBorrow,
+			EncodedParams: encodedBorrowParams,
+		})
+		utils.Info("Prepared Action 2: Borrow Asset")
+	} else {
+		utils.Info("Skipping borrow action as calculated borrow amount is zero or less.")
+	}
+
+	if len(actions) == 0 {
+		return NewError(http.StatusBadRequest, "No actions to perform. This might happen if collateral transfer is the only action and it's zero, or borrow amount is zero.")
+	}
 
 	// --- Get Unsigned Transaction ---
-	// The hydroSDK instance should be available in the server context or passed to this handler.
-	// For now, assuming it's globally accessible or retrieved via cc.hydroSDK()
-	hydroSDK := GetHydroSDK() // Assuming a helper function to get the SDK instance
-	if hydroSDK == nil {
-		return NewError(http.StatusInternalServerError, "Hydro SDK not available")
-	}
-	
-	// Note: sdk_wrappers.PrepareBatchActionsTransaction was the name in the subtask,
-	// but existing code uses ExecuteBatchActions which returns a hash if successful (implying it submits).
-	// If we need an *unsigned* tx, ExecuteBatchActions needs to be refactored or a new wrapper created.
-	// For now, let's assume ExecuteBatchActions can be adapted or a new PrepareBatchActionsTransaction exists.
-	// Let's use a hypothetical PrepareBatchActionsTransaction for now as per subtask's intent.
-	// unsignedTx, err := sdk_wrappers.ExecuteBatchActions(hydroSDK, userAddress, actions) // This submits
-	
-	// Placeholder for a function that prepares but does not send:
-	// func PrepareBatchActionsTransaction(hydro sdk.Hydro, userAddress common.Address, contractAddress common.Address, actions []SDKBatchAction, value *big.Int, options *TransactionOptions) (*common.UnsignedTxDataForClient, error)
-	// For now, we'll mock the call to a non-existent function to match subtask intent for "Get Unsigned Transaction"
-	
-	// Mocking the call as the actual PrepareBatchActionsTransaction is not yet in sdk_wrappers
-	// This would typically involve:
-	// 1. Getting the margin contract ABI and address.
-	// 2. Packing the "batch" method with the `actions`.
-	// 3. Constructing the raw transaction data (to, data, value, gas (estimated)).
-	// This part needs the actual `sdk_wrappers.PrepareBatchActionsTransaction` to be implemented.
-	// For now, we return a dummy response or error.
-	
-	// Let's assume `sdk_wrappers.ExecuteBatchActions` is what we have and it's meant to be modified
-	// or a new `PrepareBatchActionsTransaction` will be created in `sdk_wrappers` later.
-	// The subtask asks to *call* `PrepareBatchActionsTransaction`.
-	// Since it doesn't exist in the current `sdk_wrappers` from previous steps, this call will fail if not stubbed.
-	// For the purpose of this subtask, we will simulate its expected behavior if it *were* implemented.
-	
-	// Simulate packing for an unsigned transaction data structure
 	if sdk_wrappers.MarginContractAddress == (goEthereumCommon.Address{}) {
 		return NewError(http.StatusInternalServerError, "Margin contract address not initialized")
 	}
 	
-	var marginContractABIForPack abi.ABI // Need to re-parse or ensure it's accessible
+	var marginContractABIForPack abi.ABI 
 	marginContractABIForPack, err = abi.JSON(strings.NewReader(sdk_wrappers.MarginContractABIJsonString))
 	if err != nil {
 		return NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
@@ -206,14 +309,22 @@ func OpenMarginPosition(c echo.Context) error {
 		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions: %v", err))
 	}
 
-	// This is a simplified UnsignedTxDataForClient. Gas estimation would be more complex.
+	// TODO: Get Nonce, GasPrice, GasLimit from appropriate sources
+	nonce := uint64(0) 
+	gasPrice := big.NewInt(20000000000) // Example: 20 Gwei
+	gasLimit := uint64(1000000)    // Example: 1 Million gas limit for batch
+	chainIdBigInt, _ := hydroSDK.GetChainID(context.Background())
+
+
 	unsignedTxForClient := &common.UnsignedTxDataForClient{
 		From:     userAddress.Hex(),
 		To:       sdk_wrappers.MarginContractAddress.Hex(),
-		Value:    "0", // Assuming no ETH value sent directly to batch function
+		Value:    "0", 
 		Data:     goEthereumCommon.Bytes2Hex(packedBatchData),
-		GasPrice: "0", // Placeholder - should be estimated or from config
-		GasLimit: "0", // Placeholder - should be estimated
+		Nonce:    fmt.Sprintf("%d", nonce),
+		GasPrice: gasPrice.String(), 
+		GasLimit: fmt.Sprintf("%d", gasLimit),
+		ChainID:  chainIdBigInt.String(),
 	}
 	
 	utils.Info("Successfully prepared unsigned transaction for opening margin position.")
@@ -223,13 +334,10 @@ func OpenMarginPosition(c echo.Context) error {
 // CloseMarginPositionReq defines the request structure for closing a margin position.
 // For now, it assumes full closure of all debts in the specified market.
 type CloseMarginPositionReq struct {
-	MarketID string `json:"marketID" validate:"required"` // e.g., "HOT-ETH"
-	// TODO: Add optional AmountToCloseBase and AmountToCloseQuote if partial closure is supported later.
+	MarketID string `json:"marketID" validate:"required"` 
 }
 
 // CloseMarginPosition handles the request to close a margin position in a given market.
-// This involves repaying all debts for base and quote assets in that market
-// and withdrawing all remaining collateral from that market's margin account to common balance.
 func CloseMarginPosition(c echo.Context) error {
 	req := &CloseMarginPositionReq{}
 	if err := BindAndValidate(c, req); err != nil {
@@ -243,7 +351,7 @@ func CloseMarginPosition(c echo.Context) error {
 	if err != nil {
 		return NewError(http.StatusNotFound, fmt.Sprintf("Market %s not found", req.MarketID))
 	}
-	marketUint16ID := market.ID // This is already uint16
+	marketUint16ID := market.ID_uint16() 
 
 	hydroSDK := GetHydroSDK()
 	if hydroSDK == nil {
@@ -252,22 +360,17 @@ func CloseMarginPosition(c echo.Context) error {
 
 	var actions []sdk_wrappers.SDKBatchAction
 
-	// --- Fetch current debts and balances ---
 	baseTokenAddr := goEthereumCommon.HexToAddress(market.BaseTokenAddress)
 	quoteTokenAddr := goEthereumCommon.HexToAddress(market.QuoteTokenAddress)
 
-	// Get Base Asset Debt
 	baseBorrowed, err := sdk_wrappers.GetAmountBorrowed(hydroSDK, userAddress, marketUint16ID, baseTokenAddr)
 	if err != nil {
 		utils.Errorf("Failed to get base amount borrowed for market %s, user %s: %v", req.MarketID, userAddress.Hex(), err)
-		// Not returning error immediately, as some methods might not be in placeholder ABI.
-		// A zero value for baseBorrowed will mean no repay action for base asset.
 		baseBorrowed = big.NewInt(0)
 	} else {
 		utils.Infof("User %s borrowed %s of base asset %s in market %s", userAddress.Hex(), baseBorrowed.String(), market.BaseTokenSymbol, req.MarketID)
 	}
 
-	// Get Quote Asset Debt
 	quoteBorrowed, err := sdk_wrappers.GetAmountBorrowed(hydroSDK, userAddress, marketUint16ID, quoteTokenAddr)
 	if err != nil {
 		utils.Errorf("Failed to get quote amount borrowed for market %s, user %s: %v", req.MarketID, userAddress.Hex(), err)
@@ -276,7 +379,6 @@ func CloseMarginPosition(c echo.Context) error {
 		utils.Infof("User %s borrowed %s of quote asset %s in market %s", userAddress.Hex(), quoteBorrowed.String(), market.QuoteTokenSymbol, req.MarketID)
 	}
 
-	// Action 1: Repay Base Asset Debt (if any)
 	if baseBorrowed != nil && baseBorrowed.Cmp(big.NewInt(0)) > 0 {
 		encodedRepayBaseParams, err := sdk_wrappers.EncodeRepayParamsForBatch(marketUint16ID, baseTokenAddr, baseBorrowed)
 		if err != nil {
@@ -289,7 +391,6 @@ func CloseMarginPosition(c echo.Context) error {
 		utils.Info("Prepared Action: Repay Base Asset Debt (%s %s)", baseBorrowed.String(), market.BaseTokenSymbol)
 	}
 
-	// Action 2: Repay Quote Asset Debt (if any)
 	if quoteBorrowed != nil && quoteBorrowed.Cmp(big.NewInt(0)) > 0 {
 		encodedRepayQuoteParams, err := sdk_wrappers.EncodeRepayParamsForBatch(marketUint16ID, quoteTokenAddr, quoteBorrowed)
 		if err != nil {
@@ -302,11 +403,10 @@ func CloseMarginPosition(c echo.Context) error {
 		utils.Info("Prepared Action: Repay Quote Asset Debt (%s %s)", quoteBorrowed.String(), market.QuoteTokenSymbol)
 	}
 
-	// Get current balances in the margin account for withdrawal
 	baseBalanceInMarginAccount, err := sdk_wrappers.MarketBalanceOf(hydroSDK, marketUint16ID, baseTokenAddr, userAddress)
 	if err != nil {
 		utils.Errorf("Failed to get base balance in margin account for market %s, user %s: %v", req.MarketID, userAddress.Hex(), err)
-		baseBalanceInMarginAccount = big.NewInt(0) // Assume zero if error, to prevent withdrawal issues if method fails
+		baseBalanceInMarginAccount = big.NewInt(0) 
 	} else {
 		utils.Infof("User %s has %s of base asset %s in margin account for market %s", userAddress.Hex(), baseBalanceInMarginAccount.String(), market.BaseTokenSymbol, req.MarketID)
 	}
@@ -314,12 +414,11 @@ func CloseMarginPosition(c echo.Context) error {
 	quoteBalanceInMarginAccount, err := sdk_wrappers.MarketBalanceOf(hydroSDK, marketUint16ID, quoteTokenAddr, userAddress)
 	if err != nil {
 		utils.Errorf("Failed to get quote balance in margin account for market %s, user %s: %v", req.MarketID, userAddress.Hex(), err)
-		quoteBalanceInMarginAccount = big.NewInt(0) // Assume zero if error
+		quoteBalanceInMarginAccount = big.NewInt(0) 
 	} else {
 		utils.Infof("User %s has %s of quote asset %s in margin account for market %s", userAddress.Hex(), quoteBalanceInMarginAccount.String(), market.QuoteTokenSymbol, req.MarketID)
 	}
 	
-	// Define paths for transferring from margin account to common balance
 	fromMarginPath := sdk_wrappers.SDKBalancePath{
 		Category: sdk_wrappers.SDKBalanceCategoryCollateralAccount,
 		MarketID: marketUint16ID,
@@ -327,11 +426,10 @@ func CloseMarginPosition(c echo.Context) error {
 	}
 	toCommonPath := sdk_wrappers.SDKBalancePath{
 		Category: sdk_wrappers.SDKBalanceCategoryCommon,
-		MarketID: 0, // Not applicable for common balance path
+		MarketID: 0, 
 		User:     userAddress,
 	}
 
-	// Action 3: Transfer Remaining Base Collateral
 	if baseBalanceInMarginAccount != nil && baseBalanceInMarginAccount.Cmp(big.NewInt(0)) > 0 {
 		encodedTransferBaseParams, err := sdk_wrappers.EncodeTransferParamsForBatch(baseTokenAddr, fromMarginPath, toCommonPath, baseBalanceInMarginAccount)
 		if err != nil {
@@ -344,7 +442,6 @@ func CloseMarginPosition(c echo.Context) error {
 		utils.Info("Prepared Action: Withdraw Remaining Base Collateral (%s %s)", baseBalanceInMarginAccount.String(), market.BaseTokenSymbol)
 	}
 
-	// Action 4: Transfer Remaining Quote Collateral
 	if quoteBalanceInMarginAccount != nil && quoteBalanceInMarginAccount.Cmp(big.NewInt(0)) > 0 {
 		encodedTransferQuoteParams, err := sdk_wrappers.EncodeTransferParamsForBatch(quoteTokenAddr, fromMarginPath, toCommonPath, quoteBalanceInMarginAccount)
 		if err != nil {
@@ -361,7 +458,6 @@ func CloseMarginPosition(c echo.Context) error {
 		return NewError(http.StatusOK, "No debts to repay and no collateral to withdraw in the specified market account.")
 	}
 	
-	// --- Get Unsigned Transaction (Simulated) ---
 	if sdk_wrappers.MarginContractAddress == (goEthereumCommon.Address{}) {
 		return NewError(http.StatusInternalServerError, "Margin contract address not initialized")
 	}
@@ -375,13 +471,21 @@ func CloseMarginPosition(c echo.Context) error {
 		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for closing position: %v", err))
 	}
 
+	nonce := uint64(0) 
+	gasPrice := big.NewInt(20000000000) 
+	gasLimit := uint64(1000000)    
+	chainIdBigInt, _ := hydroSDK.GetChainID(context.Background())
+
+
 	unsignedTxForClient := &common.UnsignedTxDataForClient{
 		From:     userAddress.Hex(),
 		To:       sdk_wrappers.MarginContractAddress.Hex(),
 		Value:    "0",
 		Data:     goEthereumCommon.Bytes2Hex(packedBatchData),
-		GasPrice: "0", // Placeholder
-		GasLimit: "0", // Placeholder
+		Nonce:    fmt.Sprintf("%d", nonce),
+		GasPrice: gasPrice.String(), 
+		GasLimit: fmt.Sprintf("%d", gasLimit),
+		ChainID: chainIdBigInt.String(),
 	}
 
 	utils.Info("Successfully prepared unsigned transaction for closing margin position in market %s.", req.MarketID)

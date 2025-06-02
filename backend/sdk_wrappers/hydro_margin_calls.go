@@ -1,23 +1,19 @@
 package sdk_wrappers
 
 import (
-	"fmt"
-	"math/big"
-	"strings"
-
-	// "github.com/HydroProtocol/hydro-scaffold-dex/backend/models" // Not directly used in this file but might be for more complex wrappers
 	"context" // Added context
+	"encoding/binary"
 	"fmt"
 	"math/big"
 	"strings"
 
-	// "github.com/HydroProtocol/hydro-scaffold-dex/backend/models" // Not directly used in this file but might be for more complex wrappers
 	hydroSDKCommon "github.com/HydroProtocol/hydro-sdk-backend/common" // For types.GethCallMsg
 	"github.com/HydroProtocol/hydro-sdk-backend/sdk"                   // Alias to avoid conflict if HydroSDK also has "sdk"
 	"github.com/HydroProtocol/hydro-sdk-backend/sdk/ethereum"         // For type assertion to EthereumHydro
 	"github.com/HydroProtocol/hydro-sdk-backend/utils"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	goEthereumCommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/shopspring/decimal"
 )
 
@@ -25,6 +21,7 @@ var hydroABI abi.ABI
 var HydroContractAddress goEthereumCommon.Address
 var marginContractABI abi.ABI
 var MarginContractAddress goEthereumCommon.Address
+var genericPriceOracleABI abi.ABI // Added for GenericPriceOracle
 
 // InitHydroWrappers parses ABIs and sets contract addresses.
 // hydroContractAddressHex is for the existing exchange contract.
@@ -64,16 +61,24 @@ func InitHydroWrappers(hydroContractAddressHex string, marginContractAddressHex 
 	// }
 	// utils.Dump("GenericPriceOracle ABI Initialized.")
 
+	// Initialize Generic Price Oracle ABI
+	genericPriceOracleABI, err = abi.JSON(strings.NewReader(GenericPriceOracleABIJsonString))
+	if err != nil {
+		return fmt.Errorf("failed to parse GenericPriceOracle ABI: %v", err)
+	}
+	utils.Dump("GenericPriceOracle ABI Initialized.")
 
 	return nil
 }
 
 // SDKAccountDetails mirrors the structure returned by the contract's getAccountDetails function.
+// Note: The ABI output for getAccountDetails is a tuple named "details".
+// The struct fields must match the component names in that tuple for direct UnpackIntoInterface.
 type SDKAccountDetails struct {
-	Liquidatable        bool
-	Status              uint8 // 0 for Normal, 1 for Liquid (adjust based on actual contract enum)
-	DebtsTotalUSDValue  *big.Int
-	AssetsTotalUSDValue *big.Int
+	Liquidatable        bool     `abi:"liquidatable"`
+	Status              uint8    `abi:"status"`
+	DebtsTotalUSDValue  *big.Int `abi:"debtsTotalUSDValue"`
+	AssetsTotalUSDValue *big.Int `abi:"balancesTotalUSDValue"` // ABI name is balancesTotalUSDValue
 }
 
 // GetAccountDetails calls the Hydro contract's getAccountDetails function.
@@ -582,19 +587,18 @@ func GetAmountBorrowed(hydro sdk.Hydro, userAddress goEthereumCommon.Address, ma
 
 // --- Additional Margin Contract Specific Wrappers ---
 
-// SDKAssetInfo mirrors the structure for asset-specific information from the Margin contract.
-// TODO: Define the actual fields based on the contract's getAssetInfo output struct.
-type SDKAssetInfo struct {
-	// Example fields - replace with actual ones:
-	IsActive         bool
-	Price            *big.Int
-	CollateralFactor *big.Int // e.g., 0.75 * 1e18 for 75%
-	// Add other fields like borrow cap, supply cap, reserve factor, etc.
+// SDKAsset represents the structure returned by the Margin Contract's `getAsset` method.
+type SDKAsset struct {
+	LendingPoolToken goEthereumCommon.Address `abi:"lendingPoolToken"`
+	PriceOracle      goEthereumCommon.Address `abi:"priceOracle"`
+	InterestModel    goEthereumCommon.Address `abi:"interestModel"`
+	// Add other fields from the ABI's Asset_Data struct if they are part of the tuple
 }
 
-// GetAssetInfo calls the Margin contract's getAssetInfo function.
+// GetAsset calls the Margin contract's getAsset function.
 // This function retrieves detailed information about a specific asset in the margin system.
-func GetAssetInfo(hydro sdk.Hydro, assetAddress goEthereumCommon.Address) (*SDKAssetInfo, error) {
+// Note: The ABI method name is "getAsset".
+func GetAsset(hydro sdk.Hydro, assetAddress goEthereumCommon.Address) (*SDKAsset, error) {
 	if len(marginContractABI.Methods) == 0 {
 		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
 	}
@@ -602,7 +606,7 @@ func GetAssetInfo(hydro sdk.Hydro, assetAddress goEthereumCommon.Address) (*SDKA
 		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
 	}
 
-	methodName := "getAssetInfo"
+	methodName := "getAsset" // ABI method name
 	method, ok := marginContractABI.Methods[methodName]
 	if !ok {
 		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
@@ -628,19 +632,85 @@ func GetAssetInfo(hydro sdk.Hydro, assetAddress goEthereumCommon.Address) (*SDKA
 		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
 	}
 	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
-		return nil, fmt.Errorf("Margin Contract call to %s returned no data", methodName)
+		// The getAsset method returns a tuple, so it should not return empty data.
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data but expected a tuple", methodName)
 	}
 
 	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
 
-	var assetInfo SDKAssetInfo
-	err = method.Outputs.UnpackIntoInterface(&assetInfo, resultBytes)
+	var assetOutput SDKAsset
+	// The output is a single tuple named "asset". Unpack directly into the struct.
+	err = method.Outputs.UnpackIntoInterface(&assetOutput, resultBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract) into SDKAssetInfo: %v. Raw: %x", methodName, err, resultBytes)
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract) into SDKAsset: %v. Raw: %x", methodName, err, resultBytes)
 	}
 
-	return &assetInfo, nil
+	return &assetOutput, nil
 }
+
+
+// GetOraclePrice calls the getPrice(address asset) method of a given price oracle contract.
+func GetOraclePrice(hydro sdk.Hydro, oracleAddress goEthereumCommon.Address, assetAddress goEthereumCommon.Address) (*big.Int, error) {
+	if len(genericPriceOracleABI.Methods) == 0 {
+		return nil, fmt.Errorf("GenericPriceOracle ABI not initialized")
+	}
+
+	methodName := "getPrice"
+	method, ok := genericPriceOracleABI.Methods[methodName]
+	if !ok {
+		return nil, fmt.Errorf("method %s not found in GenericPriceOracle ABI", methodName)
+	}
+
+	// Pack arguments for the getPrice(address asset) call
+	packedArgs, err := method.Inputs.Pack(assetAddress)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack arguments for %s (Oracle: %s, Asset: %s): %v", methodName, oracleAddress.Hex(), assetAddress.Hex(), err)
+	}
+	
+	// Construct call data: methodID + packedArgs
+	// Method ID is the first 4 bytes of the Keccak256 hash of the function signature.
+	// The abi.Method object contains this ID.
+	data := append(method.ID, packedArgs...)
+
+
+	var responseData []byte
+	var callErr error
+
+	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
+		ethCl := hydroEth.EthClient()
+		callMsg := hydroSDKCommon.GethCallMsg{To: &oracleAddress, Data: data}
+		responseData, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
+	} else {
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient for oracle call %s", methodName)
+	}
+
+	if callErr != nil {
+		return nil, fmt.Errorf("oracle contract call to %s (Oracle: %s, Asset: %s) failed: %v", methodName, oracleAddress.Hex(), assetAddress.Hex(), callErr)
+	}
+	if len(responseData) == 0 && method.Outputs.Length() > 0 {
+		return nil, fmt.Errorf("oracle contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
+	}
+
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Oracle '%s' (Oracle: %s, Asset: %s) raw responseData: %x", methodName, oracleAddress.Hex(), assetAddress.Hex(), responseData))
+
+	results, err := method.Outputs.Unpack(responseData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack output for %s (Oracle: %s, Asset: %s): %v. Raw: %x", methodName, oracleAddress.Hex(), assetAddress.Hex(), err, responseData)
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no output returned from oracle %s, expected 1 (price)", methodName)
+	}
+
+	price, ok := results[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("output from oracle %s is not *big.Int, type is %T. Value: %v", methodName, results[0], results[0])
+	}
+
+	utils.Infof("Oracle price for asset %s from oracle %s: %s", assetAddress.Hex(), oracleAddress.Hex(), price.String())
+	return price, nil
+}
+
 
 // SDKAuctionDetails mirrors the structure for auction details from the Margin contract.
 // TODO: Define the actual fields based on the contract's getAuctionDetails output struct.
@@ -827,12 +897,154 @@ func GenerateMarginOrderDataHex(
 	// reserved          | 48   | 6     | 26             |
 	// Total             | 256  | 32    |                |
 
-	// TODO: Implement the actual bit-packing logic above.
-	// Example of how one might start (this is NOT a complete or correct packing):
-	// var data [32]byte
-	// data[0] = byte(version)
-	// if isSell { data[1] = 1 }
-	// ... and so on for all fields, being careful with byte order and bitwise operations.
+	var orderDataBytes [32]byte
 
-	return "", fmt.Errorf("GenerateMarginOrderDataHex bit-packing is not yet fully implemented")
+	// version (1 byte) [0]
+	orderDataBytes[0] = byte(version)
+
+	// side (1 byte: 0 for buy, 1 for sell) [1]
+	if isSell {
+		orderDataBytes[1] = 1
+	} else {
+		orderDataBytes[1] = 0
+	}
+
+	// isMarketOrder (1 byte: 0 for limit, 1 for market) [2]
+	if isMarketOrder {
+		orderDataBytes[2] = 1
+	} else {
+		orderDataBytes[2] = 0
+	}
+
+	// expiredAt (5 bytes, uint40 seconds) [3:7]
+	// We need to take the lower 5 bytes of the int64.
+	// binary.BigEndian.PutUint64 expects an 8-byte slice.
+	var expiredAtBytes [8]byte
+	binary.BigEndian.PutUint64(expiredAtBytes[:], uint64(expiredAtSec))
+	copy(orderDataBytes[3:8], expiredAtBytes[3:8]) // Copy the lower 5 bytes (uint40)
+
+	// asMakerFeeRate (2 bytes, uint16, rate * 100000) [8:9]
+	makerFeeRateInt := asMakerFeeRate.Mul(decimal.NewFromInt(100000)).IntPart()
+	binary.BigEndian.PutUint16(orderDataBytes[8:10], uint16(makerFeeRateInt))
+
+	// asTakerFeeRate (2 bytes, uint16, rate * 100000) [10:11]
+	takerFeeRateInt := asTakerFeeRate.Mul(decimal.NewFromInt(100000)).IntPart()
+	binary.BigEndian.PutUint16(orderDataBytes[10:12], uint16(takerFeeRateInt))
+
+	// makerRebateRate (2 bytes, uint16, rate * 100000) [12:13]
+	makerRebateRateInt := makerRebateRate.Mul(decimal.NewFromInt(100000)).IntPart()
+	binary.BigEndian.PutUint16(orderDataBytes[12:14], uint16(makerRebateRateInt))
+	
+	// salt (8 bytes, uint64) [14:21]
+	binary.BigEndian.PutUint64(orderDataBytes[14:22], uint64(salt))
+
+	// isMakerOnly (1 byte) [22]
+	if isMakerOnly {
+		orderDataBytes[22] = 1
+	} else {
+		orderDataBytes[22] = 0
+	}
+
+	// balanceCategory (1 byte, uint8) [23]
+	orderDataBytes[23] = byte(balanceCategory)
+
+	// marketID (2 bytes, uint16) [24:25] (This is orderDataMarketID)
+	binary.BigEndian.PutUint16(orderDataBytes[24:26], orderDataMarketID)
+
+	// reserved (6 bytes) [26:31] - already zeros by default initialization of array
+
+	return hexutil.Encode(orderDataBytes[:]), nil
+}
+
+// --- Market Parameter Wrappers ---
+
+// MarketMarginParams holds margin-specific parameters for a market.
+type MarketMarginParams struct {
+	InitialMarginFraction     decimal.Decimal // e.g., 0.2 for 20%
+	MaintenanceMarginFraction decimal.Decimal // e.g., 0.1 for 10%
+	LiquidateRate             decimal.Decimal // e.g., 1.1 for 110%
+	// Add other fields like borrowEnable, specific asset params if needed from contract's getMarket
+}
+
+// GetMarketMarginParameters fetches margin parameters for a given marketID.
+// TODO: This function needs to be properly implemented to call a view function on the MarginContract.
+// The current MarginContractABI (key-feature subset) does not have a direct getMarket(uint16) method
+// that returns IMR/MMR. This implies IMR/MMR might be derived or stored off-chain (e.g., in markets DB table).
+// For now, this returns mocked values.
+func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginParams, error) {
+	utils.Warningf("SDK_WRAPPER_TODO: GetMarketMarginParameters for marketID %d is returning MOCKED data. Implement actual contract call or DB lookup.", marketID)
+
+	// Placeholder/Mocked data:
+	params := &MarketMarginParams{
+		InitialMarginFraction:     decimal.NewFromFloat(0.20), // Corresponds to 5x max leverage (1 / 0.20 = 5)
+		MaintenanceMarginFraction: decimal.NewFromFloat(0.10), // 10% maintenance margin
+		LiquidateRate:             decimal.NewFromFloat(1.1),  // Liquidation triggered if ratio falls below 110%
+	}
+
+	// Conceptual actual implementation path (if contract has a getMarket view function):
+	// methodName := "getMarket"
+	// method, ok := marginContractABI.Methods[methodName]
+	// if !ok {
+	// 	return nil, fmt.Errorf("method %s not found in MarginContractABI", methodName)
+	// }
+	// args := []interface{}{marketID}
+	// packedArgs, err := marginContractABI.Pack(methodName, args...)
+	// if err != nil { return nil, fmt.Errorf("failed to pack args for %s: %v", methodName, err) }
+	// resultBytes, err := hydro.CallContract(MarginContractAddress, packedArgs) // Conceptual call
+	// if err != nil { return nil, fmt.Errorf("contract call to %s failed: %v", methodName, err) }
+	//
+	// var marketDataFromContract struct { // This struct must match the getMarket return tuple
+	// 	LiquidateRate *big.Int `abi:"liquidateRate"`
+	// 	// ... other fields like IMR_NUM, IMR_DEN, MMR_NUM, MMR_DEN if contract stores them as fractions
+	// }
+	// err = method.Outputs.UnpackIntoInterface(&marketDataFromContract, resultBytes)
+	// if err != nil { return nil, fmt.Errorf("failed to unpack %s output: %v", methodName, err) }
+	//
+	// params.LiquidateRate = utils.BigIntToDecimal(marketDataFromContract.LiquidateRate, 18) // Assuming 1e18 scaling for rate
+	// // params.InitialMarginFraction = ... (calculate from IMR_NUM/IMR_DEN)
+	// // params.MaintenanceMarginFraction = ... (calculate from MMR_NUM/MMR_DEN)
+
+	return params, nil
+}
+
+
+// --- ERC20 Balance Wrapper (Placeholder) ---
+
+// BalanceOf retrieves the ERC20 token balance for a user.
+// TODO: This is a placeholder. A more generic ERC20 wrapper service/package might be better.
+// It also needs a minimal ERC20 ABI with the balanceOf function.
+var erc20BalanceOfABI abi.ABI 
+
+func init() {
+	// Minimal ERC20 ABI for balanceOf
+	erc20AbiJson := `[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]`
+	var err error
+	erc20BalanceOfABI, err = abi.JSON(strings.NewReader(erc20AbiJson))
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse minimal ERC20 ABI for balanceOf: %v", err))
+	}
+}
+
+func BalanceOf(hydro sdk.Hydro, tokenAddress goEthereumCommon.Address, userAddress goEthereumCommon.Address) (decimal.Decimal, error) {
+	utils.Warningf("SDK_WRAPPER_TODO: BalanceOf for token %s, user %s is returning MOCKED data (1,000,000 * 1e18). Implement actual contract call.", tokenAddress.Hex(), userAddress.Hex())
+	// Mock a large balance for testing purposes
+	mockBalance := decimal.NewFromInt(1000000).Shift(18) // 1,000,000 tokens with 18 decimals
+
+	// Conceptual actual implementation:
+	// methodName := "balanceOf"
+	// method, ok := erc20BalanceOfABI.Methods[methodName]
+	// if !ok { return decimal.Zero, fmt.Errorf("method %s not found in ERC20 ABI", methodName) }
+	// args := []interface{}{userAddress}
+	// packedArgs, err := erc20BalanceOfABI.Pack(methodName, args...)
+	// if err != nil { return decimal.Zero, fmt.Errorf("failed to pack args for balanceOf: %v", err)}
+	// resultBytes, err := hydro.CallContract(tokenAddress, packedArgs) // Conceptual call
+	// if err != nil { return decimal.Zero, fmt.Errorf("ERC20 balanceOf call failed for token %s: %v", tokenAddress.Hex(), err)}
+	// results, err := method.Outputs.Unpack(resultBytes)
+	// if err != nil || len(results) == 0 {return decimal.Zero, fmt.Errorf("failed to unpack balanceOf result: %v", err)}
+	// balanceBigInt, ok := results[0].(*big.Int)
+	// if !ok { return decimal.Zero, fmt.Errorf("balanceOf result not *big.Int")}
+	// token, _ := models.TokenDao.GetTokenByAddress(tokenAddress.Hex()) // Need decimals
+	// return utils.BigIntToDecimal(balanceBigInt, token.Decimals), nil
+
+	return mockBalance, nil
 }

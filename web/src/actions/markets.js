@@ -46,41 +46,14 @@ export const fetchMarketMarginParameters = marketID => {
   return async dispatch => {
     dispatch({ type: FETCH_MARKET_MARGIN_PARAMETERS_REQUEST, payload: { marketID } });
     try {
-      // Conceptual Backend API Endpoint: GET /v1/markets/:marketID/margin-parameters
-      // OR extend existing GET /v1/markets/:marketID
-      // For now, assuming a dedicated endpoint:
-      // const response = await api.get(`/markets/${marketID}/margin-parameters`);
-      // Mocked response for now:
-      const response = { 
-        data: { 
-          status: 0, 
-          data: {
-            marketID,
-            initialMarginFraction: "0.2", // Example
-            maintenanceMarginFraction: "0.1", // Example
-            liquidateRate: "1.1", // Example
-            borrowEnableBase: true,
-            borrowEnableQuote: true,
-            baseAssetBorrowAPY: "0.05", // Example
-            quoteAssetBorrowAPY: "0.03" // Example
-          }
-        }
-      }; 
+      // Uses api.getMarketMarginParameters from web/src/lib/api.js
+      const response = await api.getMarketMarginParameters(marketID); 
 
-      if (response.data.status === 0) {
-        // Format numerical strings to BigNumber if needed by components, or leave as strings
-        const parameters = {
-          ...response.data.data,
-          // Example: Convert to BigNumber if components expect it
-          // initialMarginFraction: new BigNumber(response.data.data.initialMarginFraction),
-          // maintenanceMarginFraction: new BigNumber(response.data.data.maintenanceMarginFraction),
-          // liquidateRate: new BigNumber(response.data.data.liquidateRate),
-          // baseAssetBorrowAPY: new BigNumber(response.data.data.baseAssetBorrowAPY),
-          // quoteAssetBorrowAPY: new BigNumber(response.data.data.quoteAssetBorrowAPY),
-        };
+      if (response.data.status === 0 && response.data.data) { 
+        const parameters = response.data.data; // Direct use of data object
         dispatch({
           type: FETCH_MARKET_MARGIN_PARAMETERS_SUCCESS,
-          payload: { marketID, parameters }
+          payload: { marketID, parameters } 
         });
         return parameters;
       } else {

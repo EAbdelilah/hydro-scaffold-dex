@@ -69,6 +69,45 @@ const api = {
   },
   getLoans: (marketID, userAddress) => {
     return _request('get', `/margin/loans?marketID=${marketID}&user=${userAddress}`);
+  },
+
+  // Open Margin Position
+  openMarginPosition: (params) => { // params: { marketID, side, amount, price, leverage, collateralAssetSymbol, collateralAmount, userAddress }
+    return _request('post', '/v1/margin/positions/open', params);
+  },
+
+  // Broadcast Transaction
+  broadcastTransaction: (data) => { // data: { signedRawTx } or { signedRawTxHex } depending on backend
+    return _request('post', '/v1/transactions/broadcast', data);
+  },
+
+  // Spendable Margin Balance
+  getSpendableMarginBalance: (marketID, assetSymbol, userAddress) => {
+    return _request('get', `/v1/margin/accounts/${marketID}/transferable-balance?assetSymbol=${assetSymbol}&userAddress=${userAddress}`);
+  },
+
+  // Open Positions (Margin)
+  getOpenPositions: (userAddress) => { // userAddress might be optional if backend uses auth token
+    let url = '/v1/margin/positions';
+    if (userAddress) {
+      url += `?userAddress=${userAddress}`;
+    }
+    return _request('get', url);
+  },
+
+  // Market Margin Parameters
+  getMarketMarginParameters: (marketID) => {
+    return _request('get', `/v1/markets/${marketID}/margin-parameters`);
+  },
+
+  // Close Margin Position
+  closeMarginPosition: (params) => { // params: { marketID } (userAddress implied by auth)
+    return _request('post', '/v1/margin/positions/close', params);
+  },
+
+  // Initiate Repay Loan Action (to get unsigned tx)
+  repayLoanAction: (params) => { // params: { marketID, assetAddress, amount }
+    return _request('post', '/v1/margin/loans/repay-action', params);
   }
 };
 

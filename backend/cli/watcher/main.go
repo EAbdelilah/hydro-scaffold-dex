@@ -7,27 +7,32 @@ import (
 import (
 	"context"
 	"encoding/json"
-	"github.com/HydroProtocol/nights-watch/plugin"
-	"github.com/HydroProtocol/nights-watch/structs"
+	"fmt"
+	"math/big"
+	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/cli"
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/connection"
+	"github.com/HydroProtocol/hydro-scaffold-dex/backend/messagebus"
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/models"
+	"github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers"
 	"github.com/HydroProtocol/hydro-sdk-backend/common"
 	"github.com/HydroProtocol/hydro-sdk-backend/sdk"
+	"github.com/HydroProtocol/hydro-sdk-backend/sdk/ethereum"
 	"github.com/HydroProtocol/hydro-sdk-backend/utils"
 	"github.com/HydroProtocol/nights-watch"
-	"os"
-	"strings" // For strings.NewReader
-	"github.com/ethereum/go-ethereum/accounts/abi" // For ABI parsing
-	ethcommon "github.com/ethereum/go-ethereum/common" // For HexToAddress
-	"github.com/HydroProtocol/hydro-scaffold-dex/backend/messagebus" // For message publishing
-	// Using standard log for watcher, but can be replaced with logrus or similar
+	"github.com/HydroProtocol/nights-watch/plugin"
+	"github.com/HydroProtocol/nights-watch/structs"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	ethcommon "github.com/ethereum/go-ethereum/common"
 )
 
-// TODO: REPLACE THIS WITH THE FULL ABI JSON STRING FOR THE NEW MARGIN CONTRACT
-const MarginContractABIJsonString = `[{"constant":true,"inputs":[],"name":"getAccountDetails","outputs":[{"name":"","type":"address"}],"payable":false,"stateMutability":"view","type":"function"}, {"name":"batch","inputs":[{"components":[{"name":"actionType","type":"uint8"},{"name":"encodedParams","type":"bytes"}],"name":"actions","type":"tuple[]"}],"outputs":[],"payable":true,"stateMutability":"payable","type":"function"}, {"name":"IncreaseCollateral","inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"anonymous":false,"type":"event"}, {"name":"DecreaseCollateral","inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"anonymous":false,"type":"event"}, {"name":"Borrow","inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"anonymous":false,"type":"event"}, {"name":"Repay","inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"anonymous":false,"type":"event"}]` // Simplified placeholder + new events
+// MarginContractABIJsonString contains a key-feature subset of the full Margin contract ABI for the watcher.
+// Developer MUST ensure the true, complete ABI is manually placed here later if this subset is insufficient.
+const MarginContractABIJsonString = `[{"constant":true,"inputs":[{"name":"user","type":"address"},{"name":"marketID","type":"uint16"}],"name":"getAccountDetails","outputs":[{"components":[{"name":"liquidatable","type":"bool"},{"name":"status","type":"uint8"},{"name":"debtsTotalUSDValue","type":"uint256"},{"name":"balancesTotalUSDValue","type":"uint256"}],"name":"details","type":"tuple"}],"payable":false,"stateMutability":"view","type":"function"}, {"constant":true,"inputs":[{"name":"asset","type":"address"},{"name":"user","type":"address"},{"name":"marketID","type":"uint16"}],"name":"getAmountBorrowed","outputs":[{"name":"amount","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}, {"constant":true,"inputs":[{"name":"assetAddress","type":"address"}],"name":"getAsset","outputs":[{"components":[{"name":"lendingPoolToken","type":"address"},{"name":"priceOracle","type":"address"},{"name":"interestModel","type":"address"}],"name":"asset","type":"tuple"}],"payable":false,"stateMutability":"view","type":"function"}, {"constant":false,"inputs":[{"components":[{"name":"actionType","type":"uint8"},{"name":"encodedParams","type":"bytes"}],"name":"actions","type":"tuple[]"}],"name":"batch","outputs":[],"payable":true,"stateMutability":"payable","type":"function"}, {"anonymous":false,"inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"name":"IncreaseCollateral","type":"event"}, {"anonymous":false,"inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"name":"DecreaseCollateral","type":"event"}, {"anonymous":false,"inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"name":"Borrow","type":"event"}, {"anonymous":false,"inputs":[{"indexed":true,"name":"user","type":"address"},{"indexed":true,"name":"marketID","type":"uint16"},{"indexed":true,"name":"asset","type":"address"},{"indexed":false,"name":"amount","type":"uint256"}],"name":"Repay","type":"event"} ]`; // Key-feature subset
 
 const IncreaseCollateralEventSignature = "IncreaseCollateral(address,uint16,address,uint256)"
 const DecreaseCollateralEventSignature = "DecreaseCollateral(address,uint16,address,uint256)"
@@ -37,159 +42,240 @@ const RepayEventSignature = "Repay(address,uint16,address,uint256)"
 var marginContractABI abi.ABI
 
 type DBTransactionHandler struct {
-	eventQueue common.IQueue
-	kvStore    common.IKVStore
-	redisClient *connection.RedisClient // Added redisClient for message publishing
+	eventQueue  common.IQueue
+	kvStore     common.IKVStore
+	redisClient *connection.RedisClient
 }
 
-// MarginContractEventHandler handles events emitted by the Margin Contract.
 type MarginContractEventHandler struct {
 	redisClient *connection.RedisClient
-	// Add other dependencies like DB access if needed directly, or use services.
+	hydroSDK    sdk.Hydro
+}
+
+func getAccountStatusString(statusUint8 uint8) string {
+	switch statusUint8 {
+	case 0:
+		return "Normal"
+	case 1:
+		return "MarginCall"
+	case 2:
+		return "Liquidated"
+	default:
+		return "Unknown"
+	}
 }
 
 func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
-	utils.Infof("Received Margin Contract Event: %s, TxHash: %s", logEntry.GetEventName(), logEntry.GetTransactionHash())
+	utils.Infof("Received Margin Contract Event: %s, TxHash: %s, Block: %d", logEntry.GetEventName(), logEntry.GetTransactionHash(), logEntry.GetBlockNumber())
 
-	var userAddressHex string // To store the user address string for publishing messages
+	var user ethcommon.Address
+	var eventMarketID_uint16 uint16
+	var specificAsset ethcommon.Address
+
+	if len(logEntry.GetTopics()) > 2 { // topic[0] is event sig
+		user = ethcommon.BytesToAddress(logEntry.GetTopics()[1].Bytes()) // topic[1] is typically user
+		eventMarketID_uint16 = uint16(new(big.Int).SetBytes(logEntry.GetTopics()[2].Bytes()).Uint64()) // topic[2] is typically marketID
+	} else {
+		utils.Errorf("Not enough topics in log entry for event %s, tx %s to extract user and marketID", logEntry.GetEventName(), logEntry.GetTransactionHash())
+		return
+	}
+	
+	if len(logEntry.GetTopics()) > 3 {
+		specificAsset = ethcommon.BytesToAddress(logEntry.GetTopics()[3].Bytes()) // topic[3] is typically asset
+	}
+
+	var eventData struct{ Amount *big.Int } 
 
 	switch logEntry.GetEventName() {
 	case "IncreaseCollateral":
 		event, ok := marginContractABI.Events["IncreaseCollateral"]
-		if !ok {
-			utils.Errorf("IncreaseCollateral event definition not found in ABI")
-			return
+		if !ok { utils.Errorf("IncreaseCollateral event definition not found"); return }
+		if err := event.Inputs.NonIndexed().Unpack(&eventData, logEntry.GetData()); err != nil {
+			utils.Errorf("Error unpacking IncreaseCollateral data: %v. Tx: %s", err, logEntry.GetTransactionHash()); return
 		}
-		// Unpack event data
-		// Topics: user (address), marketID (uint16), asset (address)
-		// Data: amount (uint256)
-		user := ethcommon.BytesToAddress(logEntry.GetTopics()[1].Bytes())
-		marketID := new(big.Int).SetBytes(logEntry.GetTopics()[2].Bytes()).Uint64() // marketID is uint16
-		asset := ethcommon.BytesToAddress(logEntry.GetTopics()[3].Bytes())
-		
-		var amount *big.Int
-		
-		var decodedData struct { Amount *big.Int } // Struct to hold non-indexed params
-		err := event.Inputs.NonIndexed().Unpack(&decodedData, logEntry.GetData())
-		if err != nil {
-			utils.Errorf("Error unpacking IncreaseCollateral event data: %v. Tx: %s. Data: %x", err, logEntry.GetTransactionHash(), logEntry.GetData())
-			return
+		utils.Infof("IncreaseCollateral: User %s, Market %d, Asset %s, Amount %s", user.Hex(), eventMarketID_uint16, specificAsset.Hex(), eventData.Amount.String())
+		currentPos, dbErr := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
+		if dbErr != nil {
+			utils.Errorf("IncreaseCollateral: GetOrCreate error: %v", dbErr)
+		} else {
+			if err := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), eventMarketID_uint16, true, currentPos.HasDebt); err != nil {
+				utils.Errorf("IncreaseCollateral: UpdateActivity error: %v", err)
+			}
 		}
-		amount := decodedData.Amount
-
-		utils.Infof("IncreaseCollateral Event: User: %s, MarketID: %d, Asset: %s, Amount: %s",
-			user.Hex(), marketID, asset.Hex(), amount.String())
-		userAddressHex = user.Hex()
-
-		// TODO: DAO Usage Outline for IncreaseCollateral
-		// currentPos, _ := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), uint16(marketID))
-		// errDb := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), uint16(marketID), true, currentPos.HasDebt)
-		// if errDb != nil {
-		//     utils.Errorf("Failed to update margin active position for IncreaseCollateral event: %v", errDb)
-		// }
-		// For IncreaseCollateral: Set has_collateral = TRUE. Update last_activity_timestamp. Ensure is_active = TRUE.
-
-		// TODO: Construct messagebus.TargetedMessage with ActualMessageType (e.g., MARGIN_ACCOUNT_UPDATE or specific like COLLATERAL_DEPOSITED)
-		//       and ActualPayload (e.g., struct with user, marketID, asset, amount, new_balances_usd, new_debts_usd, new_collateral_ratio).
-		//       Fetch updated account details (e.g., using sdk_wrappers.GetAccountDetails) to populate the payload fully.
-		// err = messagebus.PublishToUserQueue(w.redisClient.Client, userAddress, "ACTUAL_MESSAGE_TYPE", actualPayload)
-		// if err != nil { log.Printf("Error publishing to user queue: %v", err) }
 
 	case "DecreaseCollateral":
 		event, ok := marginContractABI.Events["DecreaseCollateral"]
-		if !ok {
-			utils.Errorf("DecreaseCollateral event definition not found in ABI")
-			return
+		if !ok { utils.Errorf("DecreaseCollateral event definition not found"); return }
+		if err := event.Inputs.NonIndexed().Unpack(&eventData, logEntry.GetData()); err != nil {
+			utils.Errorf("Error unpacking DecreaseCollateral data: %v. Tx: %s", err, logEntry.GetTransactionHash()); return
 		}
-		if len(logEntry.GetTopics()) < 4 { utils.Errorf("Not enough topics for DecreaseCollateral. Tx: %s", logEntry.GetTransactionHash()); return }
-		user := ethcommon.BytesToAddress(logEntry.GetTopics()[1].Bytes())
-		// marketID already parsed into eventMarketID_uint16
-		asset := ethcommon.BytesToAddress(logEntry.GetTopics()[3].Bytes())
-		var decodedDataDecrease struct { Amount *big.Int }
-		if err := event.Inputs.NonIndexed().Unpack(&decodedDataDecrease, logEntry.GetData()); err != nil { utils.Errorf("Unpack DecreaseCollateral: %v. Tx: %s", err, logEntry.GetTransactionHash()); return }
-		amount := decodedDataDecrease.Amount
-
-		utils.Infof("DecreaseCollateral Event: User: %s, MarketID: %d, Asset: %s, Amount: %s",
-			user.Hex(), eventMarketID_uint16, asset.Hex(), amount.String())
-		userAddressHex = user.Hex()
-		// TODO: DAO Usage Outline for DecreaseCollateral:
-		// 1. Get the specific market details (baseAsset, quoteAsset) using marketID. (Requires models.MarketDao.FindMarketByMarketID(uint16(marketID)))
-		// 2. Call sdk_wrappers.MarketBalanceOf for both base and quote assets for this userAddress & marketID. (Needs hydroSDK instance passed to handler or globally accessible)
-		// 3. Determine newHasCollateral = (baseBalanceAfterEvent > 0 || quoteBalanceAfterEvent > 0).
-		//    (Note: The event itself provides the *amount* decreased, not the final balance. Final balance must be fetched.)
-		// 4. Fetch current hasDebt flag: currentPos, _ := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), uint16(marketID))
-		// 5. Call models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), uint16(marketID), newHasCollateral, currentPos.HasDebt)
-		//    if errDb != nil { utils.Errorf("Failed to update margin active position for DecreaseCollateral event: %v", errDb) }
+		utils.Infof("DecreaseCollateral: User %s, Market %d, Asset %s, Amount %s", user.Hex(), eventMarketID_uint16, specificAsset.Hex(), eventData.Amount.String())
+		marketDBInfo, err := models.MarketDao.FindMarketByMarketID(eventMarketID_uint16)
+		if err != nil {
+			utils.Errorf("DecreaseCollateral: Error fetching market DB info for market %d: %v", eventMarketID_uint16, err)
+		} else {
+			baseAssetAddr := ethcommon.HexToAddress(marketDBInfo.BaseTokenAddress)
+			quoteAssetAddr := ethcommon.HexToAddress(marketDBInfo.QuoteTokenAddress)
+			baseBalance, errBase := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, baseAssetAddr, user)
+			if errBase != nil { utils.Warningf("DecreaseCollateral: Error fetching base balance: %v", errBase); baseBalance = big.NewInt(0) }
+			quoteBalance, errQuote := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, quoteAssetAddr, user)
+			if errQuote != nil { utils.Warningf("DecreaseCollateral: Error fetching quote balance: %v", errQuote); quoteBalance = big.NewInt(0) }
+			newHasCollateral := (baseBalance.Sign() > 0 || quoteBalance.Sign() > 0)
+			currentPos, dbErrGet := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
+			if dbErrGet != nil {
+				utils.Errorf("DecreaseCollateral: GetOrCreate error: %v", dbErrGet)
+			} else {
+				if errUpdate := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), eventMarketID_uint16, newHasCollateral, currentPos.HasDebt); errUpdate != nil {
+					utils.Errorf("DecreaseCollateral: UpdateActivity error: %v", errUpdate)
+				}
+			}
+		}
 
 	case "Borrow":
 		event, ok := marginContractABI.Events["Borrow"]
-		if !ok {
-			utils.Errorf("Borrow event definition not found in ABI")
-			return
+		if !ok { utils.Errorf("Borrow event definition not found"); return }
+		if err := event.Inputs.NonIndexed().Unpack(&eventData, logEntry.GetData()); err != nil {
+			utils.Errorf("Error unpacking Borrow data: %v. Tx: %s", err, logEntry.GetTransactionHash()); return
 		}
-		if len(logEntry.GetTopics()) < 4 { utils.Errorf("Not enough topics for Borrow. Tx: %s", logEntry.GetTransactionHash()); return }
-		user := ethcommon.BytesToAddress(logEntry.GetTopics()[1].Bytes())
-		// marketID already parsed into eventMarketID_uint16
-		asset := ethcommon.BytesToAddress(logEntry.GetTopics()[3].Bytes())
-		var decodedDataBorrow struct { Amount *big.Int }
-		if err := event.Inputs.NonIndexed().Unpack(&decodedDataBorrow, logEntry.GetData()); err != nil { utils.Errorf("Unpack Borrow: %v. Tx: %s", err, logEntry.GetTransactionHash()); return }
-		amount := decodedDataBorrow.Amount
-
-		utils.Infof("Borrow Event: User: %s, MarketID: %d, Asset: %s, Amount: %s",
-			user.Hex(), eventMarketID_uint16, asset.Hex(), amount.String())
-		userAddressHex = user.Hex()
-		// TODO: DAO Usage Outline for Borrow:
-		// currentPos, _ := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), uint16(marketID))
-		// errDb := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), uint16(marketID), currentPos.HasCollateral, true)
-		// if errDb != nil {
-		//     utils.Errorf("Failed to update margin active position for Borrow event: %v", errDb)
-		// }
-		// For Borrow: Set has_debt = TRUE. Update last_activity_timestamp. Ensure is_active = TRUE.
+		utils.Infof("Borrow: User %s, Market %d, Asset %s, Amount %s", user.Hex(), eventMarketID_uint16, specificAsset.Hex(), eventData.Amount.String())
+		currentPos, dbErr := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
+		if dbErr != nil {
+			utils.Errorf("Borrow: GetOrCreate error: %v", dbErr)
+		} else {
+			if err := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), eventMarketID_uint16, currentPos.HasCollateral, true); err != nil {
+				utils.Errorf("Borrow: UpdateActivity error: %v", err)
+			}
+		}
 
 	case "Repay":
 		event, ok := marginContractABI.Events["Repay"]
-		if !ok {
-			utils.Errorf("Repay event definition not found in ABI")
-			return
+		if !ok { utils.Errorf("Repay event definition not found"); return }
+		if err := event.Inputs.NonIndexed().Unpack(&eventData, logEntry.GetData()); err != nil {
+			utils.Errorf("Error unpacking Repay data: %v. Tx: %s", err, logEntry.GetTransactionHash()); return
 		}
-		if len(logEntry.GetTopics()) < 4 { utils.Errorf("Not enough topics for Repay. Tx: %s", logEntry.GetTransactionHash()); return }
-		user := ethcommon.BytesToAddress(logEntry.GetTopics()[1].Bytes())
-		// marketID already parsed into eventMarketID_uint16
-		asset := ethcommon.BytesToAddress(logEntry.GetTopics()[3].Bytes())
-		var decodedDataRepay struct { Amount *big.Int }
-		if err := event.Inputs.NonIndexed().Unpack(&decodedDataRepay, logEntry.GetData()); err != nil { utils.Errorf("Unpack Repay: %v. Tx: %s", err, logEntry.GetTransactionHash()); return }
-		amount := decodedDataRepay.Amount
-
-		utils.Infof("Repay Event: User: %s, MarketID: %d, Asset: %s, Amount: %s",
-			user.Hex(), eventMarketID_uint16, asset.Hex(), amount.String())
-		userAddressHex = user.Hex()
-		// TODO: DAO Usage Outline for Repay:
-		// 1. Get the specific market details (baseAsset, quoteAsset) using marketID.
-		// 2. Call sdk_wrappers.GetAmountBorrowed for both base and quote assets for this userAddress & marketID. (Needs hydroSDK instance)
-		// 3. Determine newHasDebt = (baseDebtAfterEvent > 0 || quoteDebtAfterEvent > 0).
-		//    (Note: The event itself provides the *amount* repaid, not the final debt. Final debt must be fetched.)
-		// 4. Fetch current hasCollateral flag: currentPos, _ := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), uint16(marketID))
-		// 5. Call models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), uint16(marketID), currentPos.HasCollateral, newHasDebt)
-		//    if errDb != nil { utils.Errorf("Failed to update margin active position for Repay event: %v", errDb) }
-
+		utils.Infof("Repay: User %s, Market %d, Asset %s, Amount %s", user.Hex(), eventMarketID_uint16, specificAsset.Hex(), eventData.Amount.String())
+		marketDBInfo, err := models.MarketDao.FindMarketByMarketID(eventMarketID_uint16)
+		if err != nil {
+			utils.Errorf("Repay: Error fetching market DB info for market %d: %v", eventMarketID_uint16, err)
+		} else {
+			baseAssetAddr := ethcommon.HexToAddress(marketDBInfo.BaseTokenAddress)
+			quoteAssetAddr := ethcommon.HexToAddress(marketDBInfo.QuoteTokenAddress)
+			baseDebt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
+			quoteDebt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
+			newHasDebt := (baseDebt.Sign() > 0 || quoteDebt.Sign() > 0)
+			currentPos, _ := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
+			if err := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), eventMarketID_uint16, currentPos.HasCollateral, newHasDebt); err != nil {
+				utils.Errorf("Repay: UpdateActivity error: %v", err)
+			}
+		}
+		
 	default:
-		utils.Debugf("Unhandled Margin Contract event type: %s", logEntry.GetEventName())
-		return
+		utils.Debugf("Unhandled Margin Contract event type: %s from Tx %s", logEntry.GetEventName(), logEntry.GetTransactionHash())
+		return 
 	}
 
-	// Publish TRIGGER_MARGIN_ACCOUNT_REFRESH message for all relevant events
-	if userAddressHex != "" {
-		eventMarketID_uint16 := uint16(new(big.Int).SetBytes(logEntry.GetTopics()[2].Bytes()).Uint64()) // Assuming topic[2] is always marketID for these events
-		refreshPayload := map[string]interface{}{"marketID": eventMarketID_uint16, "reason": strings.ToLower(logEntry.GetEventName())}
-		err := messagebus.PublishToUserQueue(h.redisClient.Client, userAddressHex, "TRIGGER_MARGIN_ACCOUNT_REFRESH", refreshPayload)
-		if err != nil {
-			utils.Errorf("Error publishing TRIGGER_MARGIN_ACCOUNT_REFRESH to user queue for user %s, event %s: %v", userAddressHex, logEntry.GetEventName(), err)
+	userAddressHex := user.Hex()
+	accountDetails, accDetailsErr := sdk_wrappers.GetAccountDetails(h.hydroSDK, user, eventMarketID_uint16)
+	marketDBDetails, marketDBErr := models.MarketDao.FindMarketByMarketID(eventMarketID_uint16)
+
+	updatePayload := messagebus.MarginAccountUpdateData{
+		UserAddress: userAddressHex,
+		MarketID:    eventMarketID_uint16,
+		Timestamp:   time.Now().Unix(),
+	}
+
+	if accDetailsErr == nil && accountDetails != nil {
+		updatePayload.Liquidatable = accountDetails.Liquidatable
+		updatePayload.Status = getAccountStatusString(accountDetails.Status)
+		updatePayload.DebtsTotalUSDValue = accountDetails.DebtsTotalUSDValue.String()
+		updatePayload.BalancesTotalUSDValue = accountDetails.AssetsTotalUSDValue.String()
+		if accountDetails.DebtsTotalUSDValue != nil && accountDetails.DebtsTotalUSDValue.Sign() > 0 {
+			ratio := new(big.Int).Mul(accountDetails.AssetsTotalUSDValue, utils.GetExp(18))
+			ratio.Div(ratio, accountDetails.DebtsTotalUSDValue)
+			updatePayload.CollateralRatio = ratio.String()
+		} else if accountDetails.AssetsTotalUSDValue != nil && accountDetails.AssetsTotalUSDValue.Sign() > 0 {
+			updatePayload.CollateralRatio = "inf"
 		} else {
-			utils.Infof("Published TRIGGER_MARGIN_ACCOUNT_REFRESH for user %s, event %s", userAddressHex, logEntry.GetEventName())
+			updatePayload.CollateralRatio = "0"
 		}
+	} else {
+		utils.Errorf("Error fetching account details for targeted message (%s event): %v", logEntry.GetEventName(), accDetailsErr)
+	}
+
+	if marketDBErr == nil && marketDBDetails != nil {
+		baseAssetAddr := ethcommon.HexToAddress(marketDBDetails.BaseTokenAddress)
+		quoteAssetAddr := ethcommon.HexToAddress(marketDBDetails.QuoteTokenAddress)
+
+		baseCollateralBal, _ := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, baseAssetAddr, user)
+		quoteCollateralBal, _ := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, quoteAssetAddr, user)
+		baseBorrowedAmt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
+		quoteBorrowedAmt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
+
+		var basePriceStr, quotePriceStr = "0", "0"
+		if baseAssetAddr != (ethcommon.Address{}) {
+			baseAssetContractInfo, gaiErr := sdk_wrappers.GetAsset(h.hydroSDK, baseAssetAddr)
+			if gaiErr == nil && baseAssetContractInfo.PriceOracle != (ethcommon.Address{}) {
+				if bp, bpErr := sdk_wrappers.GetOraclePrice(h.hydroSDK, baseAssetContractInfo.PriceOracle, baseAssetAddr); bpErr == nil {
+					basePriceStr = bp.String()
+				} else {
+					utils.Warningf("Watcher: Error fetching base asset oracle price for %s from oracle %s: %v", baseAssetAddr.Hex(), baseAssetContractInfo.PriceOracle.Hex(), bpErr)
+				}
+			} else if gaiErr != nil {
+				utils.Warningf("Watcher: Error fetching asset info for base asset %s: %v", baseAssetAddr.Hex(), gaiErr)
+			} else {
+				utils.Warningf("Watcher: No price oracle address found for base asset %s", baseAssetAddr.Hex())
+			}
+		}
+		if quoteAssetAddr != (ethcommon.Address{}) {
+			quoteAssetContractInfo, gaiErr := sdk_wrappers.GetAsset(h.hydroSDK, quoteAssetAddr)
+			if gaiErr == nil && quoteAssetContractInfo.PriceOracle != (ethcommon.Address{}) {
+				if qp, qpErr := sdk_wrappers.GetOraclePrice(h.hydroSDK, quoteAssetContractInfo.PriceOracle, quoteAssetAddr); qpErr == nil {
+					quotePriceStr = qp.String()
+				} else {
+					utils.Warningf("Watcher: Error fetching quote asset oracle price for %s from oracle %s: %v", quoteAssetAddr.Hex(), quoteAssetContractInfo.PriceOracle.Hex(), qpErr)
+				}
+			} else if gaiErr != nil {
+				utils.Warningf("Watcher: Error fetching asset info for quote asset %s: %v", quoteAssetAddr.Hex(), gaiErr)
+			} else {
+				utils.Warningf("Watcher: No price oracle address found for quote asset %s", quoteAssetAddr.Hex())
+			}
+		}
+
+		updatePayload.BaseAssetDetails = messagebus.AssetMarginDetails{
+			Address:          baseAssetAddr.Hex(),
+			Symbol:           marketDBDetails.BaseTokenSymbol,
+			CollateralAmount: utils.BigWeiToDecimal(baseCollateralBal, int32(marketDBDetails.BaseTokenDecimals)).String(),
+			BorrowedAmount:   utils.BigWeiToDecimal(baseBorrowedAmt, int32(marketDBDetails.BaseTokenDecimals)).String(),
+			CurrentPrice:     basePriceStr,
+		}
+		updatePayload.QuoteAssetDetails = messagebus.AssetMarginDetails{
+			Address:          quoteAssetAddr.Hex(),
+			Symbol:           marketDBDetails.QuoteTokenSymbol,
+			CollateralAmount: utils.BigWeiToDecimal(quoteCollateralBal, int32(marketDBDetails.QuoteTokenDecimals)).String(),
+			BorrowedAmount:   utils.BigWeiToDecimal(quoteBorrowedAmt, int32(marketDBDetails.QuoteTokenDecimals)).String(),
+			CurrentPrice:     quotePriceStr,
+		}
+		if marketDBDetails.LiquidateRate != nil {
+			updatePayload.LiquidateRate = marketDBDetails.LiquidateRate.String()
+		}
+	} else {
+		utils.Errorf("Error fetching market DB details for targeted message (%s event): %v", logEntry.GetEventName(), marketDBErr)
+	}
+
+	utils.Infof("Watcher: Publishing MARGIN_ACCOUNT_UPDATE for user %s, market %d. Payload: %+v", userAddressHex, eventMarketID_uint16, updatePayload)
+	publishErr := messagebus.PublishToUserQueue(h.redisClient.Client, userAddressHex, "MARGIN_ACCOUNT_UPDATE", updatePayload)
+	if publishErr != nil {
+		utils.Errorf("Error publishing MARGIN_ACCOUNT_UPDATE to user queue (%s event): %v", logEntry.GetEventName(), publishErr)
+	}
+
+	refreshPayload := map[string]interface{}{"marketID": eventMarketID_uint16, "reason": strings.ToLower(logEntry.GetEventName())}
+	errRefresh := messagebus.PublishToUserQueue(h.redisClient.Client, userAddressHex, "TRIGGER_MARGIN_ACCOUNT_REFRESH", refreshPayload)
+	if errRefresh != nil {
+		utils.Errorf("Error publishing TRIGGER_MARGIN_ACCOUNT_REFRESH to user queue for user %s, event %s: %v", userAddressHex, logEntry.GetEventName(), errRefresh)
+	} else {
+		utils.Infof("Published TRIGGER_MARGIN_ACCOUNT_REFRESH for user %s, event %s", userAddressHex, logEntry.GetEventName())
 	}
 }
-
 
 func (handler DBTransactionHandler) TxHandlerFunc(txAndReceipt *structs.RemovableTxAndReceipt) {
 	tx := txAndReceipt.Tx
@@ -218,12 +304,11 @@ func (handler DBTransactionHandler) TxHandlerFunc(txAndReceipt *structs.Removabl
 		status = common.STATUS_FAILED
 	}
 
-	//approve event should not process with engine, so update and return
 	if launchLog.ItemType == "hydroApprove" {
 		launchLog.Status = status
-		err := models.LaunchLogDao.UpdateLaunchLog(launchLog)
-		if err != nil {
-			panic(err)
+		errUpdate := models.LaunchLogDao.UpdateLaunchLog(launchLog)
+		if errUpdate != nil {
+			panic(errUpdate)
 		}
 		return
 	}
@@ -235,14 +320,13 @@ func (handler DBTransactionHandler) TxHandlerFunc(txAndReceipt *structs.Removabl
 		},
 		Hash:      hash,
 		Status:    status,
-		Timestamp: txAndReceipt.TimeStamp, //todo
+		Timestamp: txAndReceipt.TimeStamp,
 	}
 
 	bts, _ := json.Marshal(event)
-
-	err := handler.eventQueue.Push(bts)
-	if err != nil {
-		utils.Errorf("Push event into Queue Error: %v", err)
+	errQueue := handler.eventQueue.Push(bts)
+	if errQueue != nil {
+		utils.Errorf("Push event into Queue Error: %v", errQueue)
 	}
 
 	handler.kvStore.Set(common.HYDRO_WATCHER_BLOCK_NUMBER_CACHE_KEY, strconv.FormatUint(tx.GetBlockNumber(), 10), 0)
@@ -252,16 +336,12 @@ func main() {
 	ctx, stop := context.WithCancel(context.Background())
 	go cli.WaitExitSignal(stop)
 
-	// Init Database Client
 	models.Connect(os.Getenv("HSK_DATABASE_URL"))
-
-	// Init Redis client
 	redisClient := connection.NewRedisClient(os.Getenv("HSK_REDIS_URL"))
 
-	// init Key/Value Store
 	kvStore, err := common.InitKVStore(&common.RedisKVStoreConfig{
 		Ctx:    ctx,
-		Client: redisClient, // Corrected: use redisClient
+		Client: redisClient,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("Failed to init KVStore: %v", err))
@@ -269,23 +349,15 @@ func main() {
 
 	queue, err := common.InitQueue(&common.RedisQueueConfig{
 		Name:   common.HYDRO_ENGINE_EVENTS_QUEUE_KEY,
-		Client: redisClient, // Corrected: use redisClient
+		Client: redisClient,
 		Ctx:    ctx,
 	})
 	if err != nil {
 		panic(err)
 	}
 
-	// only interested in tx send by launcher
 	filter := func(tx sdk.Transaction) bool {
-		launchLog := models.LaunchLogDao.FindByHash(tx.GetHash())
-
-		if launchLog == nil {
-			utils.Debugf("Skip useless transaction %s", tx.GetHash())
-			return false
-		} else {
-			return true
-		}
+		return models.LaunchLogDao.FindByHash(tx.GetHash()) != nil
 	}
 
 	dbTxHandler := DBTransactionHandler{
@@ -293,34 +365,31 @@ func main() {
 		kvStore:    kvStore,
 	}
 
-	p := plugin.NewTxReceiptPluginWithFilter(dbTxHandler.TxHandlerFunc, filter)
+	txReceiptPlugin := plugin.NewTxReceiptPluginWithFilter(dbTxHandler.TxHandlerFunc, filter)
 
 	api := os.Getenv("HSK_BLOCKCHAIN_RPC_URL")
-	w := nights_watch.NewHttpBasedEthWatcher(ctx, api)
-	w.RegisterTxReceiptPlugin(txReceiptPlugin)
+	watcher := nights_watch.NewHttpBasedEthWatcher(ctx, api)
+	watcher.RegisterTxReceiptPlugin(txReceiptPlugin)
 
-	// Initialize and Register Margin Contract Event Handler
 	var errAbi error
 	marginContractABI, errAbi = abi.JSON(strings.NewReader(MarginContractABIJsonString))
 	if errAbi != nil {
 		panic(fmt.Sprintf("Failed to parse MarginContractABIJsonString: %v", errAbi))
 	}
 
+	hydroSDKForWatcher := ethereum.NewEthereumHydro(api, "")
 	marginEventHandler := &MarginContractEventHandler{
 		redisClient: redisClient,
+		hydroSDK:    hydroSDKForWatcher,
 	}
 
-	// TODO: IMPORTANT - Replace this with the actual Margin Contract address from environment variable
-	// HSK_MARGIN_CONTRACT_ADDRESS should be set in the environment.
 	marginContractAddressHex := os.Getenv("HSK_MARGIN_CONTRACT_ADDRESS")
 	if marginContractAddressHex == "" {
 		utils.Warningf("HSK_MARGIN_CONTRACT_ADDRESS is not set. Margin event watcher will not be effective.")
-		// Decide if this should be a panic or just a warning. For now, warning.
-		// panic("HSK_MARGIN_CONTRACT_ADDRESS environment variable is required for watcher")
 	}
 
-	eventPlugin := plugin.NewContractEventPluginWithFilter(marginEventHandler, marginContractAddressHex, &marginContractABI, nil) // No specific event name filter, listen to all from this contract
-	w.RegisterContractEventPlugin(eventPlugin)
+	eventPlugin := plugin.NewContractEventPluginWithFilter(marginEventHandler, marginContractAddressHex, &marginContractABI, nil)
+	watcher.RegisterContractEventPlugin(eventPlugin)
 
 	syncedBlockInCache, err := kvStore.Get(common.HYDRO_WATCHER_BLOCK_NUMBER_CACHE_KEY)
 	if err != nil && err != common.KVStoreEmpty {
@@ -328,16 +397,16 @@ func main() {
 	}
 
 	var startFromBlock uint64
-	if b, err := strconv.Atoi(syncedBlockInCache); err == nil {
+	if b, convErr := strconv.Atoi(syncedBlockInCache); convErr == nil {
 		startFromBlock = uint64(b) + 1
 	} else {
 		startFromBlock = 0
 	}
 
 	go utils.StartMetrics()
-	errRun := w.RunTillExitFromBlock(startFromBlock) // Renamed err to errRun to avoid conflict with errAbi
-	if errRun != nil { // Corrected to check errRun
-		utils.Infof("Watcher Exit with err: %s", errRun) // Corrected to log errRun
+	errRun := watcher.RunTillExitFromBlock(startFromBlock)
+	if errRun != nil {
+		utils.Infof("Watcher Exit with err: %s", errRun)
 	} else {
 		utils.Infof("Watcher Exit")
 	}

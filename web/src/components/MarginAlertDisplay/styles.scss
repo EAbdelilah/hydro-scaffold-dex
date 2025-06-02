@@ -1,0 +1,51 @@
+// web/src/components/MarginAlertDisplay/styles.scss
+.margin-alert-banner {
+    padding: 10px 15px; // Adjusted padding
+    position: fixed; 
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1050; // High z-index to be on top
+    text-align: center;
+    border-bottom: 1px solid #ccc;
+    display: flex; // For aligning text and button
+    justify-content: space-between; // Pushes button to the right
+    align-items: center; // Vertically aligns items
+
+    &.alert-critical {
+        background-color: #f8d7da; 
+        color: #721c24;
+        border-color: #f5c6cb; // Matching border color
+    }
+    &.alert-warning {
+        background-color: #fff3cd; 
+        color: #856404;
+        border-color: #ffeeba;
+    }
+    &.alert-healthy {
+        background-color: #d4edda; 
+        color: #155724;
+        border-color: #c3e6cb;
+    }
+    &.alert-info { // Default/info style
+        background-color: #d1ecf1;
+        color: #0c5460;
+        border-color: #bee5eb;
+    }
+
+    button {
+        background: none;
+        border: none;
+        font-size: 1.5rem; // Made close button a bit larger
+        cursor: pointer;
+        padding: 0 5px; // Reduced padding for the button itself
+        margin-left: 15px; // Space between message and button
+        line-height: 1; // Ensure close button aligns well
+        color: inherit; // Inherit color from parent for better theme matching
+        opacity: 0.7;
+
+        &:hover {
+            opacity: 1;
+        }
+    }
+}
