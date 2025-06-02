@@ -52,6 +52,10 @@ func loadRoutes(e *echo.Echo) {
 	addRoute(e, "POST", "/margin/loans/borrow", &CollateralManagementReq{}, BorrowLoan, authMiddleware) // Reusing CollateralManagementReq for borrow
 	addRoute(e, "POST", "/margin/loans/repay", &CollateralManagementReq{}, RepayLoan, authMiddleware)    // Reusing CollateralManagementReq for repay
 	addRoute(e, "GET", "/margin/loans", &LoanListReq{}, GetLoans, authMiddleware)
+
+	// Margin Position Routes
+	addRoute(e, "POST", "/v1/margin/positions/open", &OpenMarginPositionReq{}, OpenMarginPosition, authMiddleware)
+	addRoute(e, "POST", "/v1/margin/positions/close", &CloseMarginPositionReq{}, CloseMarginPosition, authMiddleware)
 }
 
 func addRoute(e *echo.Echo, method, url string, param Param, handler func(p Param) (interface{}, error), middlewares ...echo.MiddlewareFunc) {
@@ -146,9 +150,9 @@ func StartServer(ctx context.Context, startMetric func()) {
 	hydro = ethereum.NewEthereumHydro(os.Getenv("HSK_BLOCKCHAIN_RPC_URL"), os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS"))
 
 	// Init SDK Wrappers
-	// HSK_HYBRID_EXCHANGE_ADDRESS is used as the address for the core Hydro contract containing margin functions.
-	// This might need to be a different environment variable if the margin functionalities are in a separate contract.
-	if err := sdk_wrappers.InitHydroWrappers(os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS")); err != nil {
+	// HSK_HYBRID_EXCHANGE_ADDRESS is for the original Hydro exchange contract.
+	// HSK_MARGIN_CONTRACT_ADDRESS is for the new Margin contract.
+	if err := sdk_wrappers.InitHydroWrappers(os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS"), os.Getenv("HSK_MARGIN_CONTRACT_ADDRESS")); err != nil {
 		panic(fmt.Sprintf("Failed to initialize Hydro SDK Wrappers: %v", err))
 	}
 

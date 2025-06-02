@@ -7,9 +7,12 @@ import (
 
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/models"
 	sw "github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers"
+	"github.com/HydroProtocol/hydro-sdk-backend/common"
 	"github.com/HydroProtocol/hydro-sdk-backend/utils" // For DecimalToBigInt, Dump
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/shopspring/decimal"
+	"strings"
 	// "github.com/HydroProtocol/hydro-sdk-go/sdk" // Placeholder for actual SDK package
 )
 
@@ -99,13 +102,29 @@ func BorrowLoan(p Param) (interface{}, error) {
 		EncodedParams: encodedParams,
 	}
 
-	// --- Execute Batch Action ---
-	txHash, err := sw.ExecuteBatchActions(hydro, commonUserAddress, []sw.SDKBatchAction{action})
+	// --- Prepare Unsigned Transaction ---
+	if sw.MarginContractAddress == (common.Address{}) {
+		return nil, NewError(http.StatusInternalServerError, "Margin contract address not initialized")
+	}
+	marginContractABIForPack, err := abi.JSON(strings.NewReader(sw.MarginContractABIJsonString))
 	if err != nil {
-		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to execute borrow transaction: %v", err))
+		return nil, NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
+	}
+	packedBatchData, err := marginContractABIForPack.Pack("batch", []sw.SDKBatchAction{action})
+	if err != nil {
+		return nil, NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for borrow: %v", err))
 	}
 
-	return map[string]string{"transactionHash": txHash.Hex()}, nil
+	unsignedTxForClient := &common.UnsignedTxDataForClient{
+		From:     commonUserAddress.Hex(),
+		To:       sw.MarginContractAddress.Hex(),
+		Value:    "0", // Assuming no ETH value sent directly to batch function
+		Data:     common.Bytes2Hex(packedBatchData),
+		GasPrice: "0", // Placeholder - should be estimated or from config
+		GasLimit: "0", // Placeholder - should be estimated
+	}
+	utils.Info("Prepared unsigned transaction for borrow loan.")
+	return unsignedTxForClient, nil
 }
 
 // GetLoans lists the current loans for a user in a specific margin market.
@@ -152,11 +171,29 @@ func GetLoans(p Param) (interface{}, error) {
 	} else {
 		if baseBorrowedBigInt.Cmp(big.NewInt(0)) > 0 {
 			baseBorrowedDecimal := utils.WeiToDecimalAmount(baseBorrowedBigInt, market.BaseTokenDecimals)
-			loans = append(loans, LoanDetails{
+			baseBorrowedDecimal := utils.WeiToDecimalAmount(baseBorrowedBigInt, market.BaseTokenDecimals)
+			loanDetail := LoanDetails{
 				AssetAddress:   market.BaseTokenAddress,
 				Symbol:         market.BaseTokenSymbol,
 				AmountBorrowed: baseBorrowedDecimal,
-			})
+			}
+
+			// Optionally, fetch and add interest rates
+			// Note: GetInterestRates might take an `extraBorrowAmount` which is 0 for current rates.
+			// The actual calculation of accrued interest might be complex and depend on time, etc.
+			// For now, just fetching the rate.
+			interestRates, errRates := sw.GetInterestRates(hydro, commonBaseTokenAddress, big.NewInt(0))
+			if errRates != nil {
+				utils.Warningf("Failed to get interest rates for base asset %s in market %s: %v", market.BaseTokenSymbol, req.MarketID, errRates)
+				// Do not fail the whole request, just omit interest rate if not available
+			} else if interestRates != nil {
+				// Assuming BorrowInterestRate is an annual rate, needs conversion based on contract's representation (e.g., per block, per second)
+				// This is a placeholder for actual accrued interest calculation.
+				// For now, storing the raw rate as a decimal (assuming 18 decimals for the rate itself).
+				loanDetail.CurrentInterestRate = utils.WeiToDecimalAmount(interestRates.BorrowInterestRate, 18) // Placeholder: use actual rate decimals
+				utils.Infof("Interest rate for base asset %s: %s", market.BaseTokenSymbol, loanDetail.CurrentInterestRate.String())
+			}
+			loans = append(loans, loanDetail)
 		}
 	}
 
@@ -168,11 +205,20 @@ func GetLoans(p Param) (interface{}, error) {
 	} else {
 		if quoteBorrowedBigInt.Cmp(big.NewInt(0)) > 0 {
 			quoteBorrowedDecimal := utils.WeiToDecimalAmount(quoteBorrowedBigInt, market.QuoteTokenDecimals)
-			loans = append(loans, LoanDetails{
+			loanDetail := LoanDetails{
 				AssetAddress:   market.QuoteTokenAddress,
 				Symbol:         market.QuoteTokenSymbol,
 				AmountBorrowed: quoteBorrowedDecimal,
-			})
+			}
+
+			interestRates, errRates := sw.GetInterestRates(hydro, commonQuoteTokenAddress, big.NewInt(0))
+			if errRates != nil {
+				utils.Warningf("Failed to get interest rates for quote asset %s in market %s: %v", market.QuoteTokenSymbol, req.MarketID, errRates)
+			} else if interestRates != nil {
+				loanDetail.CurrentInterestRate = utils.WeiToDecimalAmount(interestRates.BorrowInterestRate, 18) // Placeholder
+				utils.Infof("Interest rate for quote asset %s: %s", market.QuoteTokenSymbol, loanDetail.CurrentInterestRate.String())
+			}
+			loans = append(loans, loanDetail)
 		}
 	}
 
@@ -249,11 +295,27 @@ func RepayLoan(p Param) (interface{}, error) {
 		EncodedParams: encodedParams,
 	}
 
-	// --- Execute Batch Action (SDK Call Placeholder) ---
-	txHash, err := sw.ExecuteBatchActions(hydro, commonUserAddress, []sw.SDKBatchAction{action})
+	// --- Prepare Unsigned Transaction ---
+	if sw.MarginContractAddress == (common.Address{}) {
+		return nil, NewError(http.StatusInternalServerError, "Margin contract address not initialized")
+	}
+	marginContractABIForPack, err := abi.JSON(strings.NewReader(sw.MarginContractABIJsonString))
 	if err != nil {
-		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to execute repay transaction: %v", err))
+		return nil, NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
+	}
+	packedBatchData, err := marginContractABIForPack.Pack("batch", []sw.SDKBatchAction{action})
+	if err != nil {
+		return nil, NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for repay: %v", err))
 	}
 
-	return map[string]string{"transactionHash": txHash.Hex()}, nil
+	unsignedTxForClient := &common.UnsignedTxDataForClient{
+		From:     commonUserAddress.Hex(),
+		To:       sw.MarginContractAddress.Hex(),
+		Value:    "0", // Assuming no ETH value sent directly to batch function
+		Data:     common.Bytes2Hex(packedBatchData),
+		GasPrice: "0", // Placeholder - should be estimated or from config
+		GasLimit: "0", // Placeholder - should be estimated
+	}
+	utils.Info("Prepared unsigned transaction for repay loan.")
+	return unsignedTxForClient, nil
 }

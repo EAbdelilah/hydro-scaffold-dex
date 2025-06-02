@@ -7,8 +7,10 @@ import (
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/models"
 	sw "github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers" // SDK Wrappers
 	"github.com/HydroProtocol/hydro-sdk-backend/utils"
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/shopspring/decimal"
+	"strings"
 	// "github.com/HydroProtocol/hydro-sdk-go/sdk" // Placeholder for actual SDK package
 )
 
@@ -187,12 +189,29 @@ func DepositToCollateral(p Param) (interface{}, error) {
 		EncodedParams: encodedParams,
 	}
 
-	txHash, err := sw.ExecuteBatchActions(hydro, commonUserAddress, []sw.SDKBatchAction{action})
+	// --- Prepare Unsigned Transaction ---
+	if sw.MarginContractAddress == (common.Address{}) {
+		return nil, NewError(http.StatusInternalServerError, "Margin contract address not initialized")
+	}
+	marginContractABIForPack, err := abi.JSON(strings.NewReader(sw.MarginContractABIJsonString))
 	if err != nil {
-		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to execute batch deposit: %v", err))
+		return nil, NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
+	}
+	packedBatchData, err := marginContractABIForPack.Pack("batch", []sw.SDKBatchAction{action})
+	if err != nil {
+		return nil, NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for deposit: %v", err))
 	}
 
-	return map[string]string{"transactionHash": txHash.Hex()}, nil
+	unsignedTxForClient := &common.UnsignedTxDataForClient{
+		From:     commonUserAddress.Hex(),
+		To:       sw.MarginContractAddress.Hex(),
+		Value:    "0", // Assuming no ETH value sent directly to batch function
+		Data:     common.Bytes2Hex(packedBatchData),
+		GasPrice: "0", // Placeholder - should be estimated or from config
+		GasLimit: "0", // Placeholder - should be estimated
+	}
+	utils.Info("Prepared unsigned transaction for collateral deposit.")
+	return unsignedTxForClient, nil
 }
 
 // WithdrawFromCollateral handles withdrawing assets from a user's margin account for a specific market.
@@ -268,10 +287,27 @@ func WithdrawFromCollateral(p Param) (interface{}, error) {
 		EncodedParams: encodedParams,
 	}
 
-	txHash, err := sw.ExecuteBatchActions(hydro, commonUserAddress, []sw.SDKBatchAction{action})
+	// --- Prepare Unsigned Transaction ---
+	if sw.MarginContractAddress == (common.Address{}) {
+		return nil, NewError(http.StatusInternalServerError, "Margin contract address not initialized")
+	}
+	marginContractABIForPack, err := abi.JSON(strings.NewReader(sw.MarginContractABIJsonString))
 	if err != nil {
-		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to execute batch withdraw: %v", err))
+		return nil, NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
+	}
+	packedBatchData, err := marginContractABIForPack.Pack("batch", []sw.SDKBatchAction{action})
+	if err != nil {
+		return nil, NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for withdraw: %v", err))
 	}
 
-	return map[string]string{"transactionHash": txHash.Hex()}, nil
+	unsignedTxForClient := &common.UnsignedTxDataForClient{
+		From:     commonUserAddress.Hex(),
+		To:       sw.MarginContractAddress.Hex(),
+		Value:    "0", // Assuming no ETH value sent directly to batch function
+		Data:     common.Bytes2Hex(packedBatchData),
+		GasPrice: "0", // Placeholder - should be estimated or from config
+		GasLimit: "0", // Placeholder - should be estimated
+	}
+	utils.Info("Prepared unsigned transaction for collateral withdrawal.")
+	return unsignedTxForClient, nil
 }

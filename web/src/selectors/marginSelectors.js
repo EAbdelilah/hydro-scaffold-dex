@@ -144,13 +144,41 @@ export const getBorrowedAmount = createSelector(
   }
 );
 
-// getSpendableMarginBalance requires marketID and assetSymbol to pass to its dependent selectors
-export const getSpendableMarginBalance = createSelector(
-  // These need to be functions that re-select with all necessary arguments
-  (state, marketID, assetSymbol) => getCollateralBalance(state, marketID, assetSymbol),
-  (state, marketID, assetSymbol) => getBorrowedAmount(state, marketID, assetSymbol),
-  (collateral, borrowed) => collateral.plus(borrowed)
+// Selector for the raw map of spendable balances
+export const getMarginSpendableBalancesMap = createSelector(
+  getMarginState,
+  marginState => marginState.get('marginSpendableBalances', Map())
 );
+
+// Selector for a specific market's spendable balances (map of assetSymbol -> amount)
+export const getSpendableBalancesForMarket = createSelector(
+  [getMarginSpendableBalancesMap, (state, marketID) => marketID],
+  (balancesMap, marketID) => balancesMap.get(marketID, Map())
+);
+
+// getSpendableMarginBalance retrieves the transferable/spendable balance for a specific asset in a market.
+// This corresponds to data fetched by fetchSpendableMarginBalance action.
+export const getSpendableMarginBalance = createSelector(
+  [getSpendableBalancesForMarket, (state, marketID, assetSymbol) => assetSymbol],
+  (marketBalances, assetSymbol) => new BigNumber(marketBalances.get(assetSymbol, '0')) // Default to '0' if not found
+);
+
+export const getSpendableMarginBalanceLoading = createSelector(
+  getMarginState,
+  (state, marketID, assetSymbol) => marketID,
+  (state, marketID, assetSymbol) => assetSymbol,
+  (marginState, marketID, assetSymbol) =>
+    marginState.getIn(['ui', 'fetchSpendableMarginBalanceLoading', marketID, assetSymbol], false)
+);
+
+export const getSpendableMarginBalanceError = createSelector(
+  getMarginState,
+  (state, marketID, assetSymbol) => marketID,
+  (state, marketID, assetSymbol) => assetSymbol,
+  (marginState, marketID, assetSymbol) =>
+    marginState.getIn(['ui', 'fetchSpendableMarginBalanceError', marketID, assetSymbol], null)
+);
+
 
 export const getCollateralRatio = createSelector(
   getMarginAccountDetailsData, // This selector takes (state, marketID)

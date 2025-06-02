@@ -19,6 +19,9 @@ import {
   FETCH_LOANS_REQUEST,
   FETCH_LOANS_SUCCESS,
   FETCH_LOANS_FAILURE,
+  FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST,
+  FETCH_SPENDABLE_MARGIN_BALANCE_SUCCESS,
+  FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE,
   HANDLE_MARGIN_ACCOUNT_UPDATE, // Imported new action type
   HANDLE_MARGIN_ALERT,          // Imported new action type
   DISMISS_MARGIN_ALERT          // Imported new action type
@@ -28,6 +31,7 @@ import {
 const initialState = fromJS({
   accountDetailsByMarket: {}, // Keyed by marketID. Stores MarginAccountDetailsResp for each market.
   loansByMarket: {},          // Keyed by marketID. Stores array of loans for each market.
+  marginSpendableBalances: {}, // Keyed by marketID, then assetSymbol. Stores string amount.
   // auctions: {}, // Future use for auction data, keyed by auctionID
   ui: {
     selectedAccountType: 'spot', // "spot" or "margin" - global toggle for trading context
@@ -152,6 +156,19 @@ export default function marginReducer(state = initialState, action) {
       return state.updateIn(['ui', 'activeMarginAlerts'], alerts =>
         alerts.filter(alert => alert.get('id') !== action.payload.alertId)
       );
+
+    case FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST:
+      return state
+        .setIn(['ui', 'fetchSpendableMarginBalanceLoading', action.payload.marketID, action.payload.assetSymbol], true)
+        .setIn(['ui', 'fetchSpendableMarginBalanceError', action.payload.marketID, action.payload.assetSymbol], null);
+    case FETCH_SPENDABLE_MARGIN_BALANCE_SUCCESS:
+      return state
+        .setIn(['ui', 'fetchSpendableMarginBalanceLoading', action.payload.marketID, action.payload.assetSymbol], false)
+        .setIn(['marginSpendableBalances', action.payload.marketID, action.payload.assetSymbol], action.payload.amount);
+    case FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE:
+      return state
+        .setIn(['ui', 'fetchSpendableMarginBalanceLoading', action.payload.marketID, action.payload.assetSymbol], false)
+        .setIn(['ui', 'fetchSpendableMarginBalanceError', action.payload.marketID, action.payload.assetSymbol], action.payload.error);
 
     // case HANDLE_AUCTION_UPDATE: // Future use
     //   if (action.payload && action.payload.auctionID) {

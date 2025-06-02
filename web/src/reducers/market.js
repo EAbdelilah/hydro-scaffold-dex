@@ -1,4 +1,4 @@
-import { Map, List, OrderedMap } from 'immutable';
+import { Map, List, OrderedMap, fromJS } from 'immutable';
 
 const initialOrderbook = Map({
   bids: List(),
@@ -96,6 +96,27 @@ export default (state = initialState, action) => {
 
       state = state.setIn(['orderbook', side], state.getIn(['orderbook', side]).sort(reverseBigNumberComparator));
       return state;
+    case 'market/FETCH_MARKET_MARGIN_PARAMETERS_SUCCESS': { // Matches action type from marketActions.js
+      const { marketID, parameters } = action.payload;
+      // Ensure the market exists in the state before trying to set parameters
+      const marketIndex = state.getIn(['markets', 'data']).findIndex(m => m.id === marketID);
+      if (marketIndex !== -1) {
+        state = state.setIn(['markets', 'data', marketIndex, 'marginParams'], fromJS(parameters));
+        // If this is the current market, also update it
+        const currentMarket = state.getIn(['markets', 'currentMarket']);
+        if (currentMarket && currentMarket.id === marketID) {
+          state = state.setIn(['markets', 'currentMarket', 'marginParams'], fromJS(parameters));
+        }
+      }
+      return state;
+    }
+    // TODO: Handle FETCH_MARKET_MARGIN_PARAMETERS_REQUEST and FETCH_MARKET_MARGIN_PARAMETERS_FAILURE
+    // to set loading/error states if needed, e.g.,
+    // case 'market/FETCH_MARKET_MARGIN_PARAMETERS_REQUEST':
+    //   return state.setIn(['markets', 'marginParamsLoading', action.payload.marketID], true);
+    // case 'market/FETCH_MARKET_MARGIN_PARAMETERS_FAILURE':
+    //   return state.setIn(['markets', 'marginParamsLoading', action.payload.marketID], false)
+    //               .setIn(['markets', 'marginParamsError', action.payload.marketID], action.payload.error);
     default:
       return state;
   }

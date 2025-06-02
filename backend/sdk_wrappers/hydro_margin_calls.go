@@ -23,10 +23,13 @@ import (
 
 var hydroABI abi.ABI
 var HydroContractAddress goEthereumCommon.Address
+var marginContractABI abi.ABI
+var MarginContractAddress goEthereumCommon.Address
 
-// InitHydroWrappers parses the Hydro ABI and sets the contract address.
-// This should be called once during application startup.
-func InitHydroWrappers(hydroContractAddressHex string) error {
+// InitHydroWrappers parses ABIs and sets contract addresses.
+// hydroContractAddressHex is for the existing exchange contract.
+// marginContractAddressHex is for the new Margin Contract.
+func InitHydroWrappers(hydroContractAddressHex string, marginContractAddressHex string) error {
 	var err error
 	hydroABI, err = abi.JSON(strings.NewReader(HydroContractABIJsonString))
 	if err != nil {
@@ -38,6 +41,30 @@ func InitHydroWrappers(hydroContractAddressHex string) error {
 	}
 	HydroContractAddress = goEthereumCommon.HexToAddress(hydroContractAddressHex)
 	utils.Dump("Hydro Wrappers Initialized. Contract Address:", HydroContractAddress.Hex())
+
+	// Initialize New Margin Contract ABI and Address
+	marginContractABI, err = abi.JSON(strings.NewReader(MarginContractABIJsonString)) // MarginContractABIJsonString is from hydro_contract_abis.go
+	if err != nil {
+		return fmt.Errorf("failed to parse Margin Contract ABI: %v", err)
+	}
+
+	if !goEthereumCommon.IsHexAddress(marginContractAddressHex) {
+		return fmt.Errorf("invalid margin contract address: %s", marginContractAddressHex)
+	}
+	MarginContractAddress = goEthereumCommon.HexToAddress(marginContractAddressHex)
+	utils.Dump("Margin Contract Wrappers Initialized. Address:", MarginContractAddress.Hex())
+
+	// TODO: Consider if genericPriceOracleABI initialization is still needed or if it's part of a different setup.
+	// For now, keeping it as it was, assuming it's handled elsewhere if this function was its only initializer.
+	// If it was initialized here, it needs to be decided if it's still relevant.
+	// Example:
+	// genericPriceOracleABI, err = abi.JSON(strings.NewReader(GenericPriceOracleABIJsonString))
+	// if err != nil {
+	// 	return fmt.Errorf("failed to parse GenericPriceOracle ABI: %v", err)
+	// }
+	// utils.Dump("GenericPriceOracle ABI Initialized.")
+
+
 	return nil
 }
 
@@ -52,17 +79,17 @@ type SDKAccountDetails struct {
 // GetAccountDetails calls the Hydro contract's getAccountDetails function.
 func GetAccountDetails(hydro sdk.Hydro, userAddress goEthereumCommon.Address, marketID uint16) (*SDKAccountDetails, error) {
 	// Ensure ABI is initialized
-	if len(hydroABI.Methods) == 0 {
-		return nil, fmt.Errorf("Hydro ABI not initialized in sdk_wrappers")
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
 	}
-	if HydroContractAddress == (goEthereumCommon.Address{}) {
-		return nil, fmt.Errorf("HydroContractAddress not initialized in sdk_wrappers")
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
 	}
 
 	methodName := "getAccountDetails"
-	method, ok := hydroABI.Methods[methodName]
+	method, ok := marginContractABI.Methods[methodName]
 	if !ok {
-		return nil, fmt.Errorf("method %s not found in Hydro ABI", methodName)
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
 	}
 
 	// Prepare arguments for packing
@@ -71,9 +98,9 @@ func GetAccountDetails(hydro sdk.Hydro, userAddress goEthereumCommon.Address, ma
 		marketID,
 	}
 
-	packedInput, err := hydroABI.Pack(methodName, argsToPack...)
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack input for %s: %v", methodName, err)
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
 	}
 
 	var resultBytes []byte
@@ -81,20 +108,20 @@ func GetAccountDetails(hydro sdk.Hydro, userAddress goEthereumCommon.Address, ma
 
 	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
 		ethCl := hydroEth.EthClient()
-		callMsg := hydroSDKCommon.GethCallMsg{To: &HydroContractAddress, Data: packedInput} // Corrected type
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
 		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil) // nil for latest block
 	} else {
-		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s", methodName)
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s (Margin Contract)", methodName)
 	}
 
 	if callErr != nil {
-		return nil, fmt.Errorf("contract call to %s failed: %v", methodName, callErr)
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
 	}
 	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
-		return nil, fmt.Errorf("contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
 	}
 
-	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: '%s' raw resultBytes: %x", methodName, resultBytes))
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
 
 	var details SDKAccountDetails
 	// Unpack the results directly into the struct.
@@ -109,30 +136,33 @@ func GetAccountDetails(hydro sdk.Hydro, userAddress goEthereumCommon.Address, ma
 		// mapOutput := make(map[string]interface{})
 		// errMap := method.Outputs.UnpackIntoMap(mapOutput, resultBytes)
 		// if errMap == nil {
-		// 	 utils.Errorf("SDK_WRAPPER_ERROR: Successfully unpacked %s into map but not struct. Map Output: %v. Raw: %x", methodName, mapOutput, resultBytes)
+		// 	 utils.Errorf("SDK_WRAPPER_ERROR: Successfully unpacked %s (Margin Contract) into map but not struct. Map Output: %v. Raw: %x", methodName, mapOutput, resultBytes)
 		// } else {
-		     utils.Errorf("SDK_WRAPPER_ERROR: Failed to unpack output for %s into SDKAccountDetails struct: %v. Also failed to unpack into map (err: %v). Raw: %x", methodName, err, "N/A for direct struct unpack", resultBytes)
+		     utils.Errorf("SDK_WRAPPER_ERROR: Failed to unpack output for %s (Margin Contract) into SDKAccountDetails struct: %v. Also failed to unpack into map (err: %v). Raw: %x", methodName, err, "N/A for direct struct unpack", resultBytes)
 		// }
-		return nil, fmt.Errorf("failed to unpack output for %s: %v. Raw data: %x", methodName, err, resultBytes)
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract): %v. Raw data: %x", methodName, err, resultBytes)
 	}
 
 	return &details, nil
 }
 
-// GetMarketTransferableAmount calls the Hydro contract's getMarketTransferableAmount function.
+// GetMarketTransferableAmount calls the Margin contract's getMarketTransferableAmount function.
 func GetMarketTransferableAmount(hydro sdk.Hydro, marketID uint16, assetAddress goEthereumCommon.Address, userAddress goEthereumCommon.Address) (*big.Int, error) {
 	// Ensure ABI is initialized
-	if len(hydroABI.Methods) == 0 {
-		return nil, fmt.Errorf("Hydro ABI not initialized in sdk_wrappers")
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
 	}
-	if HydroContractAddress == (goEthereumCommon.Address{}) {
-		return nil, fmt.Errorf("HydroContractAddress not initialized in sdk_wrappers")
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
 	}
 
 	methodName := "getMarketTransferableAmount"
-	method, ok := hydroABI.Methods[methodName]
+	method, ok := marginContractABI.Methods[methodName]
 	if !ok {
-		return nil, fmt.Errorf("method %s not found in Hydro ABI", methodName)
+		// Since this method might not be in the placeholder MarginContractABIJsonString, we add a specific check.
+		// If it's expected to be part of the *actual* Margin ABI, this error is valid.
+		// If not, this function might need to be removed or adapted if it's not for the margin contract.
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
 	}
 
 	// Prepare arguments for packing - ensure order matches ABI definition
@@ -142,33 +172,33 @@ func GetMarketTransferableAmount(hydro sdk.Hydro, marketID uint16, assetAddress 
 		userAddress,
 	}
 
-	packedInput, err := hydroABI.Pack(methodName, argsToPack...)
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack input for %s: %v", methodName, err)
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
 	}
 
 	var resultBytes []byte
 	var callErr error
 	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
 		ethCl := hydroEth.EthClient()
-		callMsg := hydroSDKCommon.GethCallMsg{To: &HydroContractAddress, Data: packedInput}
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
 		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
 	} else {
-		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s", methodName)
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s (Margin Contract)", methodName)
 	}
 
 	if callErr != nil {
-		return nil, fmt.Errorf("contract call to %s failed: %v", methodName, callErr)
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
 	}
 	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
-		return nil, fmt.Errorf("contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
 	}
 
-	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: '%s' raw resultBytes: %x", methodName, resultBytes))
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
 
 	results, err := method.Outputs.Unpack(resultBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unpack output for %s: %v. Raw: %x", methodName, err, resultBytes)
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract): %v. Raw: %x", methodName, err, resultBytes)
 	}
 
 	if len(results) == 0 {
@@ -181,6 +211,71 @@ func GetMarketTransferableAmount(hydro sdk.Hydro, marketID uint16, assetAddress 
 	}
 
 	return amount, nil
+}
+
+// MarketBalanceOf calls the Margin contract's marketBalanceOf function.
+// This function retrieves the balance of a specific asset for a user within a given market context.
+func MarketBalanceOf(hydro sdk.Hydro, marketID uint16, assetAddress goEthereumCommon.Address, userAddress goEthereumCommon.Address) (*big.Int, error) {
+	// Ensure ABI is initialized
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
+	}
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
+	}
+
+	methodName := "marketBalanceOf"
+	method, ok := marginContractABI.Methods[methodName]
+	if !ok {
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
+	}
+
+	// Prepare arguments for packing - ensure order matches ABI definition: marketID, asset, user
+	argsToPack := []interface{}{
+		marketID,
+		assetAddress,
+		userAddress,
+	}
+
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
+	}
+
+	var resultBytes []byte
+	var callErr error
+	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
+		ethCl := hydroEth.EthClient()
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
+		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
+	} else {
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s (Margin Contract)", methodName)
+	}
+
+	if callErr != nil {
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
+	}
+	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
+	}
+
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
+
+	results, err := method.Outputs.Unpack(resultBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract): %v. Raw: %x", methodName, err, resultBytes)
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no output returned from %s (Margin Contract), expected 1 (balance)", methodName)
+	}
+
+	balance, ok := results[0].(*big.Int)
+	if !ok {
+		return nil, fmt.Errorf("output from %s (Margin Contract) is not *big.Int, type is %T. Value: %v", methodName, results[0], results[0])
+	}
+
+	return balance, nil
 }
 
 // SDKActionType represents the type of action in a batch.
@@ -270,33 +365,33 @@ func EncodeTransferParamsForBatch(
 	return packedBytes, nil
 }
 
-// ExecuteBatchActions calls the Hydro contract's batch function.
+// ExecuteBatchActions calls the Margin contract's batch function.
 func ExecuteBatchActions(hydro sdk.Hydro, userAddress goEthereumCommon.Address, actions []SDKBatchAction) (goEthereumCommon.Hash, error) {
 	// Ensure ABI is initialized
-	if len(hydroABI.Methods) == 0 {
-		return goEthereumCommon.Hash{}, fmt.Errorf("Hydro ABI not initialized in sdk_wrappers")
+	if len(marginContractABI.Methods) == 0 {
+		return goEthereumCommon.Hash{}, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
 	}
-	if HydroContractAddress == (goEthereumCommon.Address{}) {
-		return goEthereumCommon.Hash{}, fmt.Errorf("HydroContractAddress not initialized in sdk_wrappers")
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return goEthereumCommon.Hash{}, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
 	}
 
 	methodName := "batch"
-	_, ok := hydroABI.Methods[methodName] // Check if method exists
+	_, ok := marginContractABI.Methods[methodName] // Check if method exists
 	if !ok {
-		return goEthereumCommon.Hash{}, fmt.Errorf("method %s not found in Hydro ABI", methodName)
+		return goEthereumCommon.Hash{}, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
 	}
 
 	// The `actions` parameter is a slice of SDKBatchAction structs.
 	// SDKBatchAction struct: { ActionType SDKActionType (uint8), EncodedParams []byte }
 	// Solidity equivalent for the Action struct in BatchActions.sol: struct Action { ActionType actionType; bytes encodedParams; }
 	// The ABI packer should handle a slice of these Go structs as a dynamic array of tuples (uint8, bytes).
-	packedInput, err := hydroABI.Pack(methodName, actions)
+	packedInput, err := marginContractABI.Pack(methodName, actions)
 	if err != nil {
 		// Provide more context on error, e.g. inspect `actions` content if complex
-		return goEthereumCommon.Hash{}, fmt.Errorf("failed to pack input for %s with %d actions: %v. Actions: %+v", methodName, len(actions), err, actions)
+		return goEthereumCommon.Hash{}, fmt.Errorf("failed to pack input for %s (Margin Contract) with %d actions: %v. Actions: %+v", methodName, len(actions), err, actions)
 	}
 
-	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Call Hydro contract '%s' for User: %s with %d actions. PackedInput: %x", methodName, userAddress.Hex(), len(actions), packedInput))
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Call Margin Contract '%s' for User: %s with %d actions. PackedInput: %x", methodName, userAddress.Hex(), len(actions), packedInput))
 
 	var txHash goEthereumCommon.Hash
 	var txErr error
@@ -311,27 +406,27 @@ func ExecuteBatchActions(hydro sdk.Hydro, userAddress goEthereumCommon.Address, 
 		// opts, err := hydroEth.NewTransactionOpts(context.Background(), userAddress, nil, nil) // gasPrice, gasLimit might be nil for auto
 		// if err != nil { return common.Hash{}, fmt.Errorf("failed to create transaction opts: %v", err) }
 		//
-		// transaction, err := hydroEth.SendContractTransaction(opts, HydroContractAddress, packedInput)
+		// transaction, err := hydroEth.SendContractTransaction(opts, MarginContractAddress, packedInput) // IMPORTANT: Use MarginContractAddress
 		// if err != nil { txErr = err } else { txHash = transaction.Hash() }
 		//
 		// OR, if it's more manual:
-		// rawTx, errBuild := hydroEth.BuildRawTransaction(userAddress, HydroContractAddress, packedInput, gasLimit, gasPrice, nonce, value)
+		// rawTx, errBuild := hydroEth.BuildRawTransaction(userAddress, MarginContractAddress, packedInput, gasLimit, gasPrice, nonce, value)  // IMPORTANT: Use MarginContractAddress
 		// signedTx, errSign := hydroEth.SignTransaction(rawTx)
 		// txHash, txErr = hydroEth.SendRawTransaction(signedTx)
 
-		txErr = fmt.Errorf("actual SendTransaction via SDK for '%s' not implemented in wrapper yet", methodName)
-		// txHash = goEthereumCommon.HexToHash("0xSIMULATED_BATCH_TX_HASH_FROM_EXECUTE_" + userAddress.Hex()) // Keep error for now
+		txErr = fmt.Errorf("actual SendTransaction via SDK for '%s' (Margin Contract) not implemented in wrapper yet", methodName)
+		// txHash = goEthereumCommon.HexToHash("0xSIMULATED_BATCH_TX_HASH_FROM_EXECUTE_MARGIN_" + userAddress.Hex()) // Keep error for now
 
-		utils.Warning("TODO: ExecuteBatchActions - Actual transaction submission logic is a placeholder.")
+		utils.Warning("TODO: ExecuteBatchActions (Margin Contract) - Actual transaction submission logic is a placeholder.")
 	} else {
-		txErr = fmt.Errorf("hydro SDK object cannot be asserted to *ethereum.EthereumHydro to send transaction for %s", methodName)
+		txErr = fmt.Errorf("hydro SDK object cannot be asserted to *ethereum.EthereumHydro to send transaction for %s (Margin Contract)", methodName)
 	}
 
 	if txErr != nil {
-		return goEthereumCommon.Hash{}, fmt.Errorf("transaction for %s failed: %v", methodName, txErr)
+		return goEthereumCommon.Hash{}, fmt.Errorf("transaction for %s (Margin Contract) failed: %v", methodName, txErr)
 	}
 
-	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: '%s' conceptual txHash: %s", methodName, txHash.Hex()))
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' conceptual txHash: %s", methodName, txHash.Hex()))
 	return txHash, nil
 }
 
@@ -360,21 +455,21 @@ type SDKInterestRates struct {
 	SupplyInterestRate *big.Int // Per block or per second
 }
 
-// GetInterestRates calls the Hydro contract's getInterestRates function for a specific asset.
+// GetInterestRates calls the Margin contract's getInterestRates function for a specific asset.
 // extraBorrowAmount is optional, used by some contracts to calculate rates if borrowing more.
 func GetInterestRates(hydro sdk.Hydro, assetAddress goEthereumCommon.Address, extraBorrowAmount *big.Int) (*SDKInterestRates, error) {
 	// Ensure ABI is initialized
-	if len(hydroABI.Methods) == 0 {
-		return nil, fmt.Errorf("Hydro ABI not initialized in sdk_wrappers")
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
 	}
-	if HydroContractAddress == (goEthereumCommon.Address{}) {
-		return nil, fmt.Errorf("HydroContractAddress not initialized in sdk_wrappers")
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
 	}
 
 	methodName := "getInterestRates" // Assuming this is the contract method name
-	method, ok := hydroABI.Methods[methodName]
+	method, ok := marginContractABI.Methods[methodName]
 	if !ok {
-		return nil, fmt.Errorf("method %s not found in Hydro ABI", methodName)
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
 	}
 
 	// Prepare arguments for packing
@@ -383,29 +478,29 @@ func GetInterestRates(hydro sdk.Hydro, assetAddress goEthereumCommon.Address, ex
 		extraBorrowAmount,
 	}
 
-	packedInput, err := hydroABI.Pack(methodName, argsToPack...)
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack input for %s: %v", methodName, err)
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
 	}
 
 	var resultBytes []byte
 	var callErr error
 	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
 		ethCl := hydroEth.EthClient()
-		callMsg := hydroSDKCommon.GethCallMsg{To: &HydroContractAddress, Data: packedInput}
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
 		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
 	} else {
-		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s", methodName)
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s (Margin Contract)", methodName)
 	}
 
 	if callErr != nil {
-		return nil, fmt.Errorf("contract call to %s failed: %v", methodName, callErr)
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
 	}
 	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
-		return nil, fmt.Errorf("contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
 	}
 
-	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: '%s' raw resultBytes: %x", methodName, resultBytes))
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
 
 	var ratesOutput SDKInterestRates
 	err = method.Outputs.UnpackIntoInterface(&ratesOutput, resultBytes)
@@ -413,28 +508,28 @@ func GetInterestRates(hydro sdk.Hydro, assetAddress goEthereumCommon.Address, ex
 		var rawOutput []interface{}
 		debugErr := method.Outputs.UnpackIntoInterface(&rawOutput, resultBytes) // Try to unpack into a slice for debugging
 		if debugErr == nil {
-			utils.Errorf("SDK_WRAPPER_ERROR: Unpacked %s into []interface{}: %v. Check SDKInterestRates struct definition. Raw: %x", methodName, rawOutput, resultBytes)
+			utils.Errorf("SDK_WRAPPER_ERROR: Unpacked %s (Margin Contract) into []interface{}: %v. Check SDKInterestRates struct definition. Raw: %x", methodName, rawOutput, resultBytes)
 		}
-		return nil, fmt.Errorf("failed to unpack output for %s into SDKInterestRates struct: %v. Raw: %x", methodName, err, resultBytes)
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract) into SDKInterestRates struct: %v. Raw: %x", methodName, err, resultBytes)
 	}
 
 	return &ratesOutput, nil
 }
 
-// GetAmountBorrowed conceptually calls the Hydro contract to get the amount of a specific asset borrowed by a user in a market.
+// GetAmountBorrowed conceptually calls the Margin contract to get the amount of a specific asset borrowed by a user in a market.
 func GetAmountBorrowed(hydro sdk.Hydro, userAddress goEthereumCommon.Address, marketID uint16, assetAddress goEthereumCommon.Address) (*big.Int, error) {
 	// Ensure ABI is initialized
-	if len(hydroABI.Methods) == 0 {
-		return nil, fmt.Errorf("Hydro ABI not initialized in sdk_wrappers")
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
 	}
-	if HydroContractAddress == (goEthereumCommon.Address{}) {
-		return nil, fmt.Errorf("HydroContractAddress not initialized in sdk_wrappers")
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
 	}
 
 	methodName := "getAmountBorrowed"
-	method, ok := hydroABI.Methods[methodName]
+	method, ok := marginContractABI.Methods[methodName]
 	if !ok {
-		return nil, fmt.Errorf("method %s not found in Hydro ABI", methodName)
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
 	}
 
 	// Prepare arguments for packing - ENSURE ORDER MATCHES ABI: assetAddress, userAddress, marketID
@@ -444,33 +539,33 @@ func GetAmountBorrowed(hydro sdk.Hydro, userAddress goEthereumCommon.Address, ma
 		marketID,
 	}
 
-	packedInput, err := hydroABI.Pack(methodName, argsToPack...)
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to pack input for %s: %v", methodName, err)
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
 	}
 
 	var resultBytes []byte
 	var callErr error
 	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
 		ethCl := hydroEth.EthClient()
-		callMsg := hydroSDKCommon.GethCallMsg{To: &HydroContractAddress, Data: packedInput}
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
 		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
 	} else {
-		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s", methodName)
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient or generic call method for %s (Margin Contract)", methodName)
 	}
 
 	if callErr != nil {
-		return nil, fmt.Errorf("contract call to %s failed: %v", methodName, callErr)
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
 	}
 	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
-		return nil, fmt.Errorf("contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data but expected %d outputs", methodName, method.Outputs.Length())
 	}
 
-	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: '%s' raw resultBytes: %x", methodName, resultBytes))
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
 
 	results, err := method.Outputs.Unpack(resultBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to unpack output for %s: %v. Raw: %x", methodName, err, resultBytes)
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract): %v. Raw: %x", methodName, err, resultBytes)
 	}
 
 	if len(results) == 0 {
@@ -483,6 +578,133 @@ func GetAmountBorrowed(hydro sdk.Hydro, userAddress goEthereumCommon.Address, ma
 	}
 
 	return amount, nil
+}
+
+// --- Additional Margin Contract Specific Wrappers ---
+
+// SDKAssetInfo mirrors the structure for asset-specific information from the Margin contract.
+// TODO: Define the actual fields based on the contract's getAssetInfo output struct.
+type SDKAssetInfo struct {
+	// Example fields - replace with actual ones:
+	IsActive         bool
+	Price            *big.Int
+	CollateralFactor *big.Int // e.g., 0.75 * 1e18 for 75%
+	// Add other fields like borrow cap, supply cap, reserve factor, etc.
+}
+
+// GetAssetInfo calls the Margin contract's getAssetInfo function.
+// This function retrieves detailed information about a specific asset in the margin system.
+func GetAssetInfo(hydro sdk.Hydro, assetAddress goEthereumCommon.Address) (*SDKAssetInfo, error) {
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
+	}
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
+	}
+
+	methodName := "getAssetInfo"
+	method, ok := marginContractABI.Methods[methodName]
+	if !ok {
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
+	}
+
+	argsToPack := []interface{}{assetAddress}
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
+	}
+
+	var resultBytes []byte
+	var callErr error
+	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
+		ethCl := hydroEth.EthClient()
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
+		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
+	} else {
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient for %s (Margin Contract)", methodName)
+	}
+
+	if callErr != nil {
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
+	}
+	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data", methodName)
+	}
+
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
+
+	var assetInfo SDKAssetInfo
+	err = method.Outputs.UnpackIntoInterface(&assetInfo, resultBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract) into SDKAssetInfo: %v. Raw: %x", methodName, err, resultBytes)
+	}
+
+	return &assetInfo, nil
+}
+
+// SDKAuctionDetails mirrors the structure for auction details from the Margin contract.
+// TODO: Define the actual fields based on the contract's getAuctionDetails output struct.
+type SDKAuctionDetails struct {
+	// Example fields - replace with actual ones:
+	Auctioneer        goEthereumCommon.Address
+	AssetToSell       goEthereumCommon.Address
+	AmountToSell      *big.Int
+	AssetToBuy        goEthereumCommon.Address
+	CurrentBid        *big.Int
+	CurrentBidder     goEthereumCommon.Address
+	EndTime           *big.Int
+	IsActive          bool
+	LiquidationStatus uint8 // Enum for status like Ongoing, Claimable, Ended
+}
+
+// GetAuctionDetails calls the Margin contract's getAuctionDetails function.
+// This retrieves details for a specific auction, typically identified by an auction ID or user and market.
+func GetAuctionDetails(hydro sdk.Hydro, auctionID *big.Int) (*SDKAuctionDetails, error) { // Assuming auctionID is *big.Int
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("Margin Contract ABI not initialized in sdk_wrappers")
+	}
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("MarginContractAddress not initialized in sdk_wrappers")
+	}
+
+	methodName := "getAuctionDetails"
+	method, ok := marginContractABI.Methods[methodName]
+	if !ok {
+		return nil, fmt.Errorf("method %s not found in Margin Contract ABI", methodName)
+	}
+
+	argsToPack := []interface{}{auctionID} // Adjust if auction ID is not the only param
+	packedInput, err := marginContractABI.Pack(methodName, argsToPack...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pack input for %s (Margin Contract): %v", methodName, err)
+	}
+
+	var resultBytes []byte
+	var callErr error
+	if hydroEth, okEth := hydro.(*ethereum.EthereumHydro); okEth && hydroEth.EthClient() != nil {
+		ethCl := hydroEth.EthClient()
+		callMsg := hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: packedInput}
+		resultBytes, callErr = ethCl.CallContract(context.Background(), callMsg, nil)
+	} else {
+		return nil, fmt.Errorf("hydro SDK object does not provide a usable ethclient for %s (Margin Contract)", methodName)
+	}
+
+	if callErr != nil {
+		return nil, fmt.Errorf("Margin Contract call to %s failed: %v", methodName, callErr)
+	}
+	if len(resultBytes) == 0 && method.Outputs.Length() > 0 {
+		return nil, fmt.Errorf("Margin Contract call to %s returned no data", methodName)
+	}
+
+	utils.Dump(fmt.Sprintf("SDK_WRAPPER_DEBUG: Margin Contract '%s' raw resultBytes: %x", methodName, resultBytes))
+
+	var auctionDetails SDKAuctionDetails
+	err = method.Outputs.UnpackIntoInterface(&auctionDetails, resultBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unpack output for %s (Margin Contract) into SDKAuctionDetails: %v. Raw: %x", methodName, err, resultBytes)
+	}
+
+	return &auctionDetails, nil
 }
 
 // EncodeBorrowParamsForBatch ABI-encodes parameters for a Borrow action.
@@ -587,5 +809,30 @@ func GenerateMarginOrderDataHex(
 	// For now, returning an error is safer as this is critical and not implemented.
 	// If a placeholder hex is needed for unit testing unrelated parts, ensure it's clearly marked.
 	// Example: return "0x02000000000000006400c80000000000000000000100010000000000000000", nil
-	return "", fmt.Errorf("GenerateMarginOrderDataHex bit-packing is not implemented and is critical for margin orders")
+
+	// Structure for bytes32 data field according to Types.sol OrderParam.data:
+	// Field             | Bits | Bytes | Offset (Bytes) | Notes
+	// ------------------|------|-------|----------------|-------------------------------------------------
+	// version           | 8    | 1     | 0              |
+	// side              | 8    | 1     | 1              | 0 for buy, 1 for sell
+	// isMarketOrder     | 8    | 1     | 2              | 0 for limit, 1 for market
+	// expiredAt         | 40   | 5     | 3              | uint40 seconds
+	// asMakerFeeRate    | 16   | 2     | 8              | uint16, actual rate * 100000 (e.g., 0.1% = 100)
+	// asTakerFeeRate    | 16   | 2     | 10             | uint16, actual rate * 100000
+	// makerRebateRate   | 16   | 2     | 12             | uint16, actual rate * 100000
+	// salt              | 64   | 8     | 14             | uint64
+	// isMakerOnly       | 8    | 1     | 22             | 0 for false, 1 for true
+	// balanceCategory   | 8    | 1     | 23             | uint8, 0 for Common, 1 for CollateralAccount
+	// marketID          | 16   | 2     | 24             | uint16, orderDataMarketID (collateral market)
+	// reserved          | 48   | 6     | 26             |
+	// Total             | 256  | 32    |                |
+
+	// TODO: Implement the actual bit-packing logic above.
+	// Example of how one might start (this is NOT a complete or correct packing):
+	// var data [32]byte
+	// data[0] = byte(version)
+	// if isSell { data[1] = 1 }
+	// ... and so on for all fields, being careful with byte order and bitwise operations.
+
+	return "", fmt.Errorf("GenerateMarginOrderDataHex bit-packing is not yet fully implemented")
 }

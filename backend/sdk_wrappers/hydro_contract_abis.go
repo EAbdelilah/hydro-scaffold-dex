@@ -71,3 +71,7 @@ const HydroContractABIJsonString = `
   }
 ]
 `
+
+// MarginContractABIJsonString contains the JSON string representation of the new Margin contract ABI.
+// TODO: Replace this placeholder with the actual full Margin contract ABI JSON string.
+const MarginContractABIJsonString = `[{"constant":true,"inputs":[],"name":"getAccountDetails","outputs":[{"name":"","type":"address"}],"payable":false,"stateMutability":"view","type":"function"}, {"name":"batch","inputs":[{"components":[{"name":"actionType","type":"uint8"},{"name":"encodedParams","type":"bytes"}],"name":"actions","type":"tuple[]"}],"outputs":[],"payable":true,"stateMutability":"payable","type":"function"} ]`

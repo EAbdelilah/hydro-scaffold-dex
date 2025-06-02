@@ -27,6 +27,10 @@ export const FETCH_LOANS_REQUEST = 'margin/FETCH_LOANS_REQUEST';
 export const FETCH_LOANS_SUCCESS = 'margin/FETCH_LOANS_SUCCESS';
 export const FETCH_LOANS_FAILURE = 'margin/FETCH_LOANS_FAILURE';
 
+export const FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST = 'margin/FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST';
+export const FETCH_SPENDABLE_MARGIN_BALANCE_SUCCESS = 'margin/FETCH_SPENDABLE_MARGIN_BALANCE_SUCCESS';
+export const FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE = 'margin/FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE';
+
 // WebSocket related actions
 export const HANDLE_MARGIN_ACCOUNT_UPDATE = 'margin/HANDLE_MARGIN_ACCOUNT_UPDATE';
 export const HANDLE_MARGIN_ALERT = 'margin/HANDLE_MARGIN_ALERT';
@@ -78,6 +82,38 @@ export const depositCollateral = (marketID, assetAddress, amount) => async (disp
     }
   } catch (error) {
     dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { marketID, assetAddress, amount, error: error.message } });
+    throw error;
+  }
+};
+
+export const fetchSpendableMarginBalance = (marketID, assetSymbol, userAddress) => async (dispatch) => {
+  dispatch({ type: FETCH_SPENDABLE_MARGIN_BALANCE_REQUEST, payload: { marketID, assetSymbol, userAddress } });
+  try {
+    // Conceptual Backend API Endpoint: GET /v1/margin/accounts/:marketID/transferable-balance?assetSymbol=XXX&userAddress=YYY
+    // const response = await api.get(`/margin/accounts/${marketID}/transferable-balance?assetSymbol=${assetSymbol}&userAddress=${userAddress}`);
+    // Mocked response for now:
+    const response = {
+      data: {
+        status: 0,
+        data: {
+          amount: "123.45" // Example string representation of BigNumber
+        }
+      }
+    };
+
+    if (response.data.status === 0 && response.data.data) {
+      dispatch({
+        type: FETCH_SPENDABLE_MARGIN_BALANCE_SUCCESS,
+        payload: { marketID, assetSymbol, userAddress, amount: response.data.data.amount }
+      });
+      return response.data.data.amount;
+    } else {
+      const errorMsg = response.data.desc || 'Failed to fetch spendable margin balance';
+      dispatch({ type: FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE, payload: { marketID, assetSymbol, userAddress, error: errorMsg } });
+      throw new Error(errorMsg);
+    }
+  } catch (error) {
+    dispatch({ type: FETCH_SPENDABLE_MARGIN_BALANCE_FAILURE, payload: { marketID, assetSymbol, userAddress, error: error.message } });
     throw error;
   }
 };
