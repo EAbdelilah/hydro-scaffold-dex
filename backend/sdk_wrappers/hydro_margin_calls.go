@@ -293,6 +293,7 @@ const (
 	SDKActionTypeBorrow             SDKActionType = 3
 	SDKActionTypeRepay              SDKActionType = 4
 	SDKActionTypeLiquidate          SDKActionType = 5
+	SDKActionTypeLiquidate          SDKActionType = 5 // For initiating liquidation of an account. Note: Ensure this value is unique and correct.
 	SDKActionTypeAuctionPlaceBid    SDKActionType = 6
 	SDKActionTypeAuctionClaim       SDKActionType = 7
 )
@@ -967,84 +968,519 @@ type MarketMarginParams struct {
 }
 
 // GetMarketMarginParameters fetches margin parameters for a given marketID.
-// TODO: This function needs to be properly implemented to call a view function on the MarginContract.
-// The current MarginContractABI (key-feature subset) does not have a direct getMarket(uint16) method
-// that returns IMR/MMR. This implies IMR/MMR might be derived or stored off-chain (e.g., in markets DB table).
-// For now, this returns mocked values.
+// It first attempts to find specific getters for IMR and MMR in the ABI.
+// If not found, it falls back to deriving them from the on-chain LiquidateRate.
 func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginParams, error) {
-	utils.Warningf("SDK_WRAPPER_TODO: GetMarketMarginParameters for marketID %d is returning MOCKED data. Implement actual contract call or DB lookup.", marketID)
-
-	// Placeholder/Mocked data:
-	params := &MarketMarginParams{
-		InitialMarginFraction:     decimal.NewFromFloat(0.20), // Corresponds to 5x max leverage (1 / 0.20 = 5)
-		MaintenanceMarginFraction: decimal.NewFromFloat(0.10), // 10% maintenance margin
-		LiquidateRate:             decimal.NewFromFloat(1.1),  // Liquidation triggered if ratio falls below 110%
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("GetMarketMarginParameters: MarginContractAddress not initialized")
+	}
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("GetMarketMarginParameters: Margin Contract ABI not initialized (ABI methods map is empty)")
 	}
 
-	// Conceptual actual implementation path (if contract has a getMarket view function):
-	// methodName := "getMarket"
-	// method, ok := marginContractABI.Methods[methodName]
-	// if !ok {
-	// 	return nil, fmt.Errorf("method %s not found in MarginContractABI", methodName)
-	// }
-	// args := []interface{}{marketID}
-	// packedArgs, err := marginContractABI.Pack(methodName, args...)
-	// if err != nil { return nil, fmt.Errorf("failed to pack args for %s: %v", methodName, err) }
-	// resultBytes, err := hydro.CallContract(MarginContractAddress, packedArgs) // Conceptual call
-	// if err != nil { return nil, fmt.Errorf("contract call to %s failed: %v", methodName, err) }
-	//
-	// var marketDataFromContract struct { // This struct must match the getMarket return tuple
-	// 	LiquidateRate *big.Int `abi:"liquidateRate"`
-	// 	// ... other fields like IMR_NUM, IMR_DEN, MMR_NUM, MMR_DEN if contract stores them as fractions
-	// }
-	// err = method.Outputs.UnpackIntoInterface(&marketDataFromContract, resultBytes)
-	// if err != nil { return nil, fmt.Errorf("failed to unpack %s output: %v", methodName, err) }
-	//
-	// params.LiquidateRate = utils.BigIntToDecimal(marketDataFromContract.LiquidateRate, 18) // Assuming 1e18 scaling for rate
-	// // params.InitialMarginFraction = ... (calculate from IMR_NUM/IMR_DEN)
-	// // params.MaintenanceMarginFraction = ... (calculate from MMR_NUM/MMR_DEN)
+	params := &MarketMarginParams{}
+	var err error
+	var callErr error
+	var hydroEth *ethereum.EthereumHydro
+	var okEth bool
+
+	hydroEth, okEth = hydro.(*ethereum.EthereumHydro)
+	if !okEth || hydroEth.EthClient() == nil {
+		return nil, fmt.Errorf("GetMarketMarginParameters: hydro SDK object does not provide a usable Ethereum client")
+	}
+	ethCl := hydroEth.EthClient()
+
+	// 1. Fetch LiquidateRate from getMarket method (always needed)
+	getMarketMethodName := "getMarket"
+	getMarketMethod, ok := marginContractABI.Methods[getMarketMethodName]
+	if !ok {
+		return nil, fmt.Errorf("GetMarketMarginParameters: method '%s' not found in MarginContractABI. Ensure ABI string is complete.", getMarketMethodName)
+	}
+	marketArgsToPack := []interface{}{marketID}
+	marketPackedInput, packErr := marginContractABI.Pack(getMarketMethodName, marketArgsToPack...)
+	if packErr != nil {
+		return nil, fmt.Errorf("GetMarketMarginParameters: failed to pack args for %s: %w", getMarketMethodName, packErr)
+	}
+	marketResultBytes, marketCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: marketPackedInput}, nil)
+	if marketCallErr != nil {
+		return nil, fmt.Errorf("GetMarketMarginParameters: contract call to %s failed for marketID %d: %w", getMarketMethodName, marketID, marketCallErr)
+	}
+	if len(marketResultBytes) == 0 && getMarketMethod.Outputs.Length() > 0 {
+		return nil, fmt.Errorf("GetMarketMarginParameters: contract call to %s returned no data for marketID %d", getMarketMethodName, marketID)
+	}
+	var marketDataTuple struct {
+		BaseAsset            goEthereumCommon.Address `abi:"baseAsset"`
+		QuoteAsset           goEthereumCommon.Address `abi:"quoteAsset"`
+		LiquidateRate        *big.Int                 `abi:"liquidateRate"`
+		WithdrawRate         *big.Int                 `abi:"withdrawRate"`
+		AuctionRatioStart    *big.Int                 `abi:"auctionRatioStart"`
+		AuctionRatioPerBlock *big.Int                 `abi:"auctionRatioPerBlock"`
+		BorrowEnable         bool                     `abi:"borrowEnable"`
+	}
+	unpackErr := getMarketMethod.Outputs.UnpackIntoInterface(&marketDataTuple, marketResultBytes)
+	if unpackErr != nil {
+		return nil, fmt.Errorf("GetMarketMarginParameters: failed to unpack %s output for marketID %d: %w. Raw: %s", getMarketMethodName, marketID, unpackErr, hexutil.Encode(marketResultBytes))
+	}
+
+	if marketDataTuple.LiquidateRate != nil {
+		params.LiquidateRate = decimal.NewFromBigInt(marketDataTuple.LiquidateRate, -18)
+	} else {
+		params.LiquidateRate = decimal.Zero
+		utils.Warningf("GetMarketMarginParameters: LiquidateRate from contract (getMarket) was nil for marketID %d. Defaulting to zero.", marketID)
+	}
+
+	// 2. Attempt to fetch InitialMarginFraction directly
+	imrFetchedFromChain := false
+	imrMethodName := "getInitialMarginFraction" // Or "initialMarginFraction", "getMarketIMR", etc.
+	imrMethod, imrMethodExists := marginContractABI.Methods[imrMethodName]
+	if imrMethodExists {
+		imrArgsToPack := []interface{}{marketID}
+		imrPackedInput, packErr := imrMethod.Inputs.Pack(imrArgsToPack...) // Use imrMethod.Inputs here
+		if packErr == nil {
+			imrCallData := append(imrMethod.ID, imrPackedInput...)
+			imrResultBytes, imrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: imrCallData}, nil)
+			if imrCallErr == nil && len(imrResultBytes) > 0 {
+				var imrBigInt *big.Int
+				unpackErr := imrMethod.Outputs.UnpackIntoInterface(&imrBigInt, imrResultBytes) // Assuming it returns uint256
+				if unpackErr == nil && imrBigInt != nil {
+					params.InitialMarginFraction = decimal.NewFromBigInt(imrBigInt, -18) // Assuming 1e18 scaled
+					imrFetchedFromChain = true
+					utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction fetched from chain: %s", marketID, params.InitialMarginFraction.String())
+				} else if unpackErr != nil {
+                     utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s: %v. Raw: %s", marketID, imrMethodName, unpackErr, hexutil.Encode(imrResultBytes))
+                }
+			} else if imrCallErr != nil {
+                 utils.Warningf("GetMarketMarginParameters for marketID %d: Call to %s failed: %v", marketID, imrMethodName, imrCallErr)
+            }
+		} else if packErr != nil {
+            utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v", marketID, imrMethodName, packErr)
+        }
+	}
+
+	// 3. Attempt to fetch MaintenanceMarginFraction directly
+	mmrFetchedFromChain := false
+	mmrMethodName := "getMaintenanceMarginFraction" // Or "maintenanceMarginFraction", "getMarketMMR", etc.
+	mmrMethod, mmrMethodExists := marginContractABI.Methods[mmrMethodName]
+	if mmrMethodExists {
+		mmrArgsToPack := []interface{}{marketID}
+		mmrPackedInput, packErr := mmrMethod.Inputs.Pack(mmrArgsToPack...)
+		if packErr == nil {
+			mmrCallData := append(mmrMethod.ID, mmrPackedInput...)
+			mmrResultBytes, mmrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: mmrCallData}, nil)
+			if mmrCallErr == nil && len(mmrResultBytes) > 0 {
+				var mmrBigInt *big.Int
+				unpackErr := mmrMethod.Outputs.UnpackIntoInterface(&mmrBigInt, mmrResultBytes) // Assuming it returns uint256
+				if unpackErr == nil && mmrBigInt != nil {
+					params.MaintenanceMarginFraction = decimal.NewFromBigInt(mmrBigInt, -18) // Assuming 1e18 scaled
+					mmrFetchedFromChain = true
+					utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction fetched from chain: %s", marketID, params.MaintenanceMarginFraction.String())
+				} else if unpackErr != nil {
+                    utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s: %v. Raw: %s", marketID, mmrMethodName, unpackErr, hexutil.Encode(mmrResultBytes))
+                }
+			} else if mmrCallErr != nil {
+                utils.Warningf("GetMarketMarginParameters for marketID %d: Call to %s failed: %v", marketID, mmrMethodName, mmrCallErr)
+            }
+		} else if packErr != nil {
+            utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v", marketID, mmrMethodName, packErr)
+        }
+	}
+
+	// 4. Fallback to Database if IMR or MMR not fetched from chain
+	dbSourcedIMR := false
+	dbSourcedMMR := false
+
+	if !imrFetchedFromChain || !mmrFetchedFromChain {
+		utils.Warningf("GetMarketMarginParameters for marketID %d: IMR and/or MMR not directly available from contract. Attempting to fetch from database.", marketID)
+		// Assuming models.MarketDaoSql is the accessible DAO instance.
+		// This might need to be models.MarketDao depending on how it's initialized in your project.
+		marketDBRecord, dbErr := models.MarketDaoSql.FindMarketByMarketID(marketID)
+		if dbErr == nil && marketDBRecord != nil {
+			if !imrFetchedFromChain && marketDBRecord.InitialMarginFraction.IsPositive() {
+				params.InitialMarginFraction = marketDBRecord.InitialMarginFraction
+				imrFetchedFromChain = true // Effectively, as it's now sourced
+				dbSourcedIMR = true
+				utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction fetched from database: %s", marketID, params.InitialMarginFraction.String())
+			}
+			if !mmrFetchedFromChain && marketDBRecord.MaintenanceMarginFraction.IsPositive() {
+				params.MaintenanceMarginFraction = marketDBRecord.MaintenanceMarginFraction
+				mmrFetchedFromChain = true // Effectively, as it's now sourced
+				dbSourcedMMR = true
+				utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction fetched from database: %s", marketID, params.MaintenanceMarginFraction.String())
+			}
+		} else {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to fetch market details from database or market not found: %v", marketID, dbErr)
+		}
+	}
+
+	// 5. Final Fallback/Derivation logic if IMR or MMR still not populated
+	if !mmrFetchedFromChain { // Not from chain and not from DB (or DB value was invalid)
+		utils.Warningf("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction is DERIVED from LiquidateRate as a final fallback. VERIFY THIS LOGIC.", marketID)
+		if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
+			params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
+		} else {
+			params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05) // Fallback
+			utils.Warningf("GetMarketMarginParameters: LiquidateRate for marketID %d is %s (<= 1.0). MMR derivation might be incorrect. Defaulting MMR to %s.",
+				marketID, params.LiquidateRate.String(), params.MaintenanceMarginFraction.String())
+		}
+		// TODO: Verify if this derivation of MMR from LiquidateRate (LiquidateRate - 1) is correct as per contract logic and system design.
+	}
+
+	if !imrFetchedFromChain { // Not from chain and not from DB (or DB value was invalid)
+		utils.Warningf("GetMarketMarginParameters for marketID %d: InitialMarginFraction is DERIVED from MaintenanceMarginFraction as a final fallback. VERIFY THIS LOGIC.", marketID)
+		// Ensure MaintenanceMarginFraction is populated (either from chain, DB, or derivation) before deriving IMR
+		if params.MaintenanceMarginFraction.IsZero() && !mmrFetchedFromChain { 
+			// This case implies MMR derivation from LiquidateRate also resulted in zero or was skipped.
+			// We need a valid MMR to derive IMR. If LiquidateRate was <=1, MMR defaults to 0.05.
+			// If LiquidateRate itself was 0, then MMR would be -1 from derivation logic above, then overridden by 0.05.
+			// Re-evaluate MMR if it's still zero to prevent IMR from being just 0.10.
+			if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
+				params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
+			} else {
+				params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05) 
+			}
+		}
+		params.InitialMarginFraction = params.MaintenanceMarginFraction.Add(decimal.NewFromFloat(0.10))
+		// TODO: IMR is derived from placeholder MMR + 10% (absolute percentage points). Verify this placeholder logic against actual system requirements.
+	}
+	
+	sourceSummary := fmt.Sprintf("IMR Source: %s, MMR Source: %s",
+		getParamSource(imrFetchedFromChain, dbSourcedIMR),
+		getParamSource(mmrFetchedFromChain, dbSourcedMMR))
+
+	utils.Infof("GetMarketMarginParameters Final for marketID %d: LiquidateRate: %s, %s. BorrowEnable: %t.",
+		marketID, params.LiquidateRate.String(), sourceSummary, marketDataTuple.BorrowEnable)
 
 	return params, nil
 }
 
+// Helper function to describe parameter source for logging
+func getParamSource(isChain bool, isDB bool) string {
+	if isChain && !isDB { // implies it was truly from chain before DB check
+		return "Chain"
+	} else if isDB { // implies it was from DB (either because chain failed or was not attempted for this param)
+		return "Database"
+	}
+	return "Derived"
+}
 
-// --- ERC20 Balance Wrapper (Placeholder) ---
 
-// BalanceOf retrieves the ERC20 token balance for a user.
-// TODO: This is a placeholder. A more generic ERC20 wrapper service/package might be better.
-// It also needs a minimal ERC20 ABI with the balanceOf function.
-var erc20BalanceOfABI abi.ABI 
+// --- ERC20 Balance Wrapper ---
+
+var erc20BalanceOfABI abi.ABI
+var erc20DecimalsABI abi.ABI // For decimals()
 
 func init() {
 	// Minimal ERC20 ABI for balanceOf
-	erc20AbiJson := `[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]`
+	erc20BalanceOfAbiJson := `[{"constant":true,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"}]`
 	var err error
-	erc20BalanceOfABI, err = abi.JSON(strings.NewReader(erc20AbiJson))
+	erc20BalanceOfABI, err = abi.JSON(strings.NewReader(erc20BalanceOfAbiJson))
 	if err != nil {
 		panic(fmt.Sprintf("Failed to parse minimal ERC20 ABI for balanceOf: %v", err))
 	}
+
+	// Minimal ERC20 ABI for decimals
+	erc20DecimalsAbiJson := `[{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"}]`
+	erc20DecimalsABI, err = abi.JSON(strings.NewReader(erc20DecimalsAbiJson))
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse minimal ERC20 ABI for decimals: %v", err))
+	}
 }
 
+// GetTokenDecimals retrieves the number of decimals for an ERC20 token by making an actual contract call.
+func GetTokenDecimals(hydro sdk.Hydro, tokenAddress goEthereumCommon.Address) (int32, error) {
+	if len(erc20DecimalsABI.Methods) == 0 {
+		return 0, fmt.Errorf("GetTokenDecimals: ERC20 decimals ABI not initialized")
+	}
+
+	methodName := "decimals"
+	method, ok := erc20DecimalsABI.Methods[methodName]
+	if !ok {
+		return 0, fmt.Errorf("GetTokenDecimals: method %s not found in ERC20 decimals ABI", methodName)
+	}
+
+	// No arguments for decimals() method, so data is just the method ID.
+	data := method.ID
+
+	hydroEth, okEth := hydro.(*ethereum.EthereumHydro)
+	if !okEth || hydroEth.EthClient() == nil {
+		return 0, fmt.Errorf("GetTokenDecimals: hydro SDK object does not provide a usable Ethereum client")
+	}
+	ethCl := hydroEth.EthClient()
+
+	callMsg := hydroSDKCommon.GethCallMsg{To: &tokenAddress, Data: data}
+	responseData, callErr := ethCl.CallContract(context.Background(), callMsg, nil)
+	if callErr != nil {
+		return 0, fmt.Errorf("GetTokenDecimals: ERC20 %s call failed for token %s: %w", methodName, tokenAddress.Hex(), callErr)
+	}
+
+	if len(responseData) == 0 && method.Outputs.Length() > 0 {
+        return 0, fmt.Errorf("GetTokenDecimals: ERC20 %s call returned no data for token %s, but expected %d outputs", methodName, tokenAddress.Hex(), method.Outputs.Length())
+    }
+
+	results, err := method.Outputs.Unpack(responseData)
+	if err != nil {
+		return 0, fmt.Errorf("GetTokenDecimals: failed to unpack %s result for token %s: %w. Raw data: %s", methodName, tokenAddress.Hex(), err, hexutil.Encode(responseData))
+	}
+
+	if len(results) == 0 {
+		return 0, fmt.Errorf("GetTokenDecimals: no output returned from %s for token %s", methodName, tokenAddress.Hex())
+	}
+
+	decimalsUint8, ok := results[0].(uint8)
+	if !ok {
+		return 0, fmt.Errorf("GetTokenDecimals: %s output for token %s is not uint8, type is %T. Value: %v", methodName, tokenAddress.Hex(), results[0], results[0])
+	}
+
+	return int32(decimalsUint8), nil
+}
+
+// EncodeLiquidateAccountParamsForBatch ABI-encodes parameters for a liquidateAccount action within a batch.
+// Solidity signature (example, assuming it's part of batch actions): liquidateAccount(address user, uint16 marketID)
+// func EncodeLiquidateAccountParamsForBatch(userToLiquidate goEthereumCommon.Address, marketID uint16) ([]byte, error) {
+// 	// addressType, _ := abi.NewType("address", "", nil)
+// 	// uint16Type, _ := abi.NewType("uint16", "", nil)
+// 	// arguments := abi.Arguments{{Type: addressType, Name: "userToLiquidate"}, {Type: uint16Type, Name: "marketID"}}
+// 	// packedBytes, err := arguments.Pack(userToLiquidate, marketID)
+// 	// if err != nil {
+// 	// 	return nil, fmt.Errorf("failed to pack liquidateAccount params for batch: %v", err)
+// 	// }
+// 	// utils.LogWarnf("EncodeLiquidateAccountParamsForBatch is a conceptual placeholder. Actual BatchActions encoding might differ if liquidateAccount is a standard ActionType.")
+// 	// return packedBytes, nil
+// 	utils.Warningf("EncodeLiquidateAccountParamsForBatch is a placeholder and not fully implemented. Its usage depends on whether liquidateAccount is a standard batch action type or a direct contract method.")
+// 	return nil, fmt.Errorf("EncodeLiquidateAccountParamsForBatch not fully implemented")
+// }
+
+// PrepareLiquidateAccountDirectTransaction prepares the data for a direct call to liquidateAccount on the Margin Contract.
+// func PrepareLiquidateAccountDirectTransaction(hydro sdk.Hydro, liquidatorAddress goEthereumCommon.Address, userToLiquidate goEthereumCommon.Address, marketID uint16) (*UnsignedTxDataForClient, error) {
+// 	// if marginContractABI.Methods == nil { 
+// 	// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: Margin ABI not initialized") 
+// 	// }
+// 	// method, ok := marginContractABI.Methods["liquidateAccount"] // Assuming "liquidateAccount" is the direct method name
+// 	// if !ok { 
+// 	// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: liquidateAccount method not found in Margin ABI") 
+// 	// }
+// 	//
+// 	// packedArgs, err := method.Inputs.Pack(userToLiquidate, marketID)
+// 	// if err != nil { 
+// 	// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to pack args for liquidateAccount: %w", err) 
+// 	// }
+// 	// fullTxData := append(method.ID, packedArgs...)
+// 	//
+// 	// // TODO: Fetch nonce, gasPrice, gasLimit, chainID for liquidatorAddress
+// 	// // This would be similar to the logic in PrepareBatchActionsTransaction:
+// 	// // hydroEth, okEth := hydro.(*ethereum.EthereumHydro); // ... get ethCl
+// 	// // nonce, err := ethCl.PendingNonceAt(...)
+// 	// // gasPrice, err := ethCl.SuggestGasPrice(...)
+// 	// // callMsg := hydroSDKCommon.GethCallMsg{ From: liquidatorAddress, To: &MarginContractAddress, Data: fullTxData }
+// 	// // gasLimit, err := ethCl.EstimateGas(...) ; gasLimit = gasLimit + (gasLimit / 5)
+// 	// // chainID, err := ethCl.NetworkID(...)
+// 	//
+// 	// utils.Warningf("PrepareLiquidateAccountDirectTransaction is a placeholder and needs full nonce/gas/chainID logic and error handling.")
+// 	// // return &UnsignedTxDataForClient{ /* ... populate ... */ }, nil
+// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction is a placeholder and not fully implemented")
+// }
+
+// GetOraclePriceInQuote fetches the price of assetToPrice in terms of quoteAsset by using their respective USD prices.
+// E.g., how many quoteAssets is one unit of assetToPrice worth? (assetToPrice_USD / quoteAsset_USD)
+func GetOraclePriceInQuote(hydro sdk.Hydro, assetToPriceAddress goEthereumCommon.Address, quoteAssetAddress goEthereumCommon.Address) (decimal.Decimal, error) {
+	if assetToPriceAddress == quoteAssetAddress {
+		return decimal.NewFromInt(1), nil // Price of an asset in terms of itself is 1
+	}
+
+	// Fetch USD price of assetToPrice
+	assetToPriceInfo, err := GetAsset(hydro, assetToPriceAddress)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: failed to get asset info for assetToPrice %s: %w", assetToPriceAddress.Hex(), err)
+	}
+	if assetToPriceInfo.PriceOracle == (goEthereumCommon.Address{}) {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: no price oracle configured for assetToPrice %s", assetToPriceAddress.Hex())
+	}
+	priceAssetToPriceUSD_bigInt, err := GetOraclePrice(hydro, assetToPriceInfo.PriceOracle, assetToPriceAddress)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: failed to get USD price for assetToPrice %s from oracle %s: %w", assetToPriceAddress.Hex(), assetToPriceInfo.PriceOracle.Hex(), err)
+	}
+	// Assuming oracle prices are returned with 18 decimals for USD value
+	priceAssetToPriceUSD_dec := utils.BigIntToDecimal(priceAssetToPriceUSD_bigInt, 18)
+	if priceAssetToPriceUSD_dec.IsZero() {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: USD price for assetToPrice %s is zero", assetToPriceAddress.Hex())
+	}
+
+	// Fetch USD price of quoteAsset
+	quoteAssetInfo, err := GetAsset(hydro, quoteAssetAddress)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: failed to get asset info for quoteAsset %s: %w", quoteAssetAddress.Hex(), err)
+	}
+	if quoteAssetInfo.PriceOracle == (goEthereumCommon.Address{}) {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: no price oracle configured for quoteAsset %s", quoteAssetAddress.Hex())
+	}
+	priceQuoteAssetUSD_bigInt, err := GetOraclePrice(hydro, quoteAssetInfo.PriceOracle, quoteAssetAddress)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: failed to get USD price for quoteAsset %s from oracle %s: %w", quoteAssetAddress.Hex(), quoteAssetInfo.PriceOracle.Hex(), err)
+	}
+	priceQuoteAssetUSD_dec := utils.BigIntToDecimal(priceQuoteAssetUSD_bigInt, 18)
+	if priceQuoteAssetUSD_dec.IsZero() {
+		return decimal.Zero, fmt.Errorf("GetOraclePriceInQuote: USD price for quoteAsset %s is zero, cannot calculate relative price", quoteAssetAddress.Hex())
+	}
+
+	// Calculate relative price: assetToPrice_USD / quoteAsset_USD
+	relativePrice := priceAssetToPriceUSD_dec.Div(priceQuoteAssetUSD_dec)
+	utils.Infof("GetOraclePriceInQuote: Asset %s (USD %s) in terms of Asset %s (USD %s) = %s",
+		assetToPriceAddress.Hex(), priceAssetToPriceUSD_dec.String(),
+		quoteAssetAddress.Hex(), priceQuoteAssetUSD_dec.String(),
+		relativePrice.String())
+	return relativePrice, nil
+}
+
+// BalanceOf retrieves the ERC20 token balance for a user by making an actual contract call.
+// It uses a mocked GetTokenDecimals for now.
 func BalanceOf(hydro sdk.Hydro, tokenAddress goEthereumCommon.Address, userAddress goEthereumCommon.Address) (decimal.Decimal, error) {
-	utils.Warningf("SDK_WRAPPER_TODO: BalanceOf for token %s, user %s is returning MOCKED data (1,000,000 * 1e18). Implement actual contract call.", tokenAddress.Hex(), userAddress.Hex())
-	// Mock a large balance for testing purposes
-	mockBalance := decimal.NewFromInt(1000000).Shift(18) // 1,000,000 tokens with 18 decimals
+	if len(erc20BalanceOfABI.Methods) == 0 {
+		return decimal.Zero, fmt.Errorf("BalanceOf: ERC20 balanceOf ABI not initialized")
+	}
 
-	// Conceptual actual implementation:
-	// methodName := "balanceOf"
-	// method, ok := erc20BalanceOfABI.Methods[methodName]
-	// if !ok { return decimal.Zero, fmt.Errorf("method %s not found in ERC20 ABI", methodName) }
-	// args := []interface{}{userAddress}
-	// packedArgs, err := erc20BalanceOfABI.Pack(methodName, args...)
-	// if err != nil { return decimal.Zero, fmt.Errorf("failed to pack args for balanceOf: %v", err)}
-	// resultBytes, err := hydro.CallContract(tokenAddress, packedArgs) // Conceptual call
-	// if err != nil { return decimal.Zero, fmt.Errorf("ERC20 balanceOf call failed for token %s: %v", tokenAddress.Hex(), err)}
-	// results, err := method.Outputs.Unpack(resultBytes)
-	// if err != nil || len(results) == 0 {return decimal.Zero, fmt.Errorf("failed to unpack balanceOf result: %v", err)}
-	// balanceBigInt, ok := results[0].(*big.Int)
-	// if !ok { return decimal.Zero, fmt.Errorf("balanceOf result not *big.Int")}
-	// token, _ := models.TokenDao.GetTokenByAddress(tokenAddress.Hex()) // Need decimals
-	// return utils.BigIntToDecimal(balanceBigInt, token.Decimals), nil
+	methodName := "balanceOf"
+	method, ok := erc20BalanceOfABI.Methods[methodName]
+	if !ok {
+		return decimal.Zero, fmt.Errorf("BalanceOf: method %s not found in ERC20 balanceOf ABI", methodName)
+	}
 
-	return mockBalance, nil
+	argsToPack := []interface{}{userAddress}
+	packedArgs, err := method.Inputs.Pack(argsToPack...)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("BalanceOf: failed to pack args for %s for token %s, user %s: %w", methodName, tokenAddress.Hex(), userAddress.Hex(), err)
+	}
+
+	data := append(method.ID, packedArgs...)
+
+	hydroEth, okEth := hydro.(*ethereum.EthereumHydro)
+	if !okEth || hydroEth.EthClient() == nil {
+		return decimal.Zero, fmt.Errorf("BalanceOf: hydro SDK object does not provide a usable Ethereum client")
+	}
+	ethCl := hydroEth.EthClient()
+
+	callMsg := hydroSDKCommon.GethCallMsg{To: &tokenAddress, Data: data}
+	responseData, callErr := ethCl.CallContract(context.Background(), callMsg, nil)
+	if callErr != nil {
+		return decimal.Zero, fmt.Errorf("BalanceOf: ERC20 %s call failed for token %s, user %s: %w", methodName, tokenAddress.Hex(), userAddress.Hex(), callErr)
+	}
+
+	if len(responseData) == 0 && method.Outputs.Length() > 0 {
+		return decimal.Zero, fmt.Errorf("BalanceOf: ERC20 %s call returned no data for token %s, user %s, but expected %d outputs", methodName, tokenAddress.Hex(), userAddress.Hex(), method.Outputs.Length())
+	}
+	
+	results, err := method.Outputs.Unpack(responseData)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("BalanceOf: failed to unpack %s result for token %s, user %s: %w. Raw data: %s", methodName, tokenAddress.Hex(), userAddress.Hex(), err, hexutil.Encode(responseData))
+	}
+
+	if len(results) == 0 {
+		return decimal.Zero, fmt.Errorf("BalanceOf: no output returned from %s for token %s, user %s", methodName, tokenAddress.Hex(), userAddress.Hex())
+	}
+
+	balanceBigInt, ok := results[0].(*big.Int)
+	if !ok {
+		return decimal.Zero, fmt.Errorf("BalanceOf: %s result for token %s, user %s is not *big.Int, type is %T. Value: %v", methodName, tokenAddress.Hex(), userAddress.Hex(), results[0], results[0])
+	}
+
+	// Get token decimals (currently mocked)
+	tokenDecimals, err := GetTokenDecimals(hydro, tokenAddress)
+	if err != nil {
+		utils.Warningf("BalanceOf: Failed to get decimals for token %s: %v. Defaulting to 18.", tokenAddress.Hex(), err)
+		tokenDecimals = 18 // Default to 18 if fetching decimals fails
+	}
+
+	return decimal.NewFromBigInt(balanceBigInt, -tokenDecimals), nil
+}
+
+// UnsignedTxDataForClient holds the data for a transaction to be signed by the client.
+// Ensure this matches the structure expected by the frontend for signing.
+type UnsignedTxDataForClient struct {
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Nonce    uint64 `json:"nonce"`
+	GasPrice string `json:"gasPrice"` // string for big.Int
+	GasLimit uint64 `json:"gasLimit"`
+	Value    string `json:"value"`    // string for big.Int
+	Data     string `json:"data"`     // hex string
+	ChainID  string `json:"chainId"`  // string for big.Int
+}
+
+// PrepareBatchActionsTransaction prepares the data needed for the client to sign and send a batch transaction.
+// It fetches the nonce, suggests gas price, estimates gas limit, and gets the chain ID.
+func PrepareBatchActionsTransaction(hydro sdk.Hydro, actions []SDKBatchAction, userAddress goEthereumCommon.Address, value *big.Int) (*UnsignedTxDataForClient, error) {
+	if MarginContractAddress == (goEthereumCommon.Address{}) {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: MarginContractAddress not initialized")
+	}
+	if len(marginContractABI.Methods) == 0 {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: Margin Contract ABI not initialized")
+	}
+
+	methodName := "batch"
+	method, ok := marginContractABI.Methods[methodName]
+	if !ok {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: method %s not found in Margin Contract ABI", methodName)
+	}
+
+	// Pack the actions for the 'batch' call data
+	fullTxData, err := method.Inputs.Pack(actions)
+	if err != nil {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: failed to pack actions for %s: %w. Actions: %+v", methodName, err, actions)
+	}
+	// The actual data sent in the transaction is methodID + packed arguments
+	fullTxData = append(method.ID, fullTxData...)
+
+
+	hydroEth, okEth := hydro.(*ethereum.EthereumHydro)
+	if !okEth || hydroEth.EthClient() == nil {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: hydro SDK object does not provide a usable Ethereum client")
+	}
+	ethCl := hydroEth.EthClient()
+
+	// 1. Fetch Nonce
+	nonce, err := ethCl.PendingNonceAt(context.Background(), userAddress)
+	if err != nil {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: failed to get nonce for %s: %w", userAddress.Hex(), err)
+	}
+
+	// 2. Suggest Gas Price
+	gasPrice, err := ethCl.SuggestGasPrice(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: failed to suggest gas price: %w", err)
+	}
+
+	// 3. Estimate Gas Limit
+	callMsg := hydroSDKCommon.GethCallMsg{
+		From:  userAddress,            // User's address
+		To:    &MarginContractAddress, // Target contract
+		Data:  fullTxData,             // MethodID + packed arguments
+		Value: value,                  // ETH value to send with the transaction
+	}
+
+	gasLimit, err := ethCl.EstimateGas(context.Background(), callMsg)
+	if err != nil {
+		// Log details for debugging gas estimation failures
+		utils.Errorf("PrepareBatchActionsTransaction: Gas estimation failed. User: %s, To: %s, Value: %s, Data: %s, Error: %v",
+			userAddress.Hex(), MarginContractAddress.Hex(), value.String(), hexutil.Encode(fullTxData), err)
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: failed to estimate gas: %w", err)
+	}
+	// Add a buffer to the gas limit (e.g., 20%)
+	gasLimit = gasLimit + (gasLimit / 5)
+
+	// 4. Fetch ChainID
+	chainID, err := ethCl.NetworkID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("PrepareBatchActionsTransaction: failed to get network ID: %w", err)
+	}
+
+	// 5. Populate UnsignedTxDataForClient
+	return &UnsignedTxDataForClient{
+		From:     userAddress.Hex(),
+		To:       MarginContractAddress.Hex(),
+		Nonce:    nonce,
+		GasPrice: gasPrice.String(),
+		GasLimit: gasLimit,
+		Value:    value.String(),
+		Data:     hexutil.Encode(fullTxData),
+		ChainID:  chainID.String(),
+	}, nil
 }

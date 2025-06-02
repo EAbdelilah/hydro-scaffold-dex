@@ -153,12 +153,88 @@ func OpenMarginPosition(c echo.Context) error {
 	}
 	equityContributionUSD_dec := equityContributionDecimal.Mul(collateralAssetPriceUSD_dec)
 
-	// Simplified Borrow Amount Calculation (in USD terms) for validation
-	borrowAmountUSD_dec := equityContributionUSD_dec.Mul(leverageDecimal.Sub(decimal.NewFromInt(1)))
-	if borrowAmountUSD_dec.IsNegative() { borrowAmountUSD_dec = decimal.Zero }
+	// --- Precise Borrow Amount Calculation ---
+	var borrowAssetAddress goEthereumCommon.Address
+	var borrowAmountNativeDecimal decimal.Decimal // Amount in the borrowed asset's own decimals
+	var borrowAmountUSD_dec decimal.Decimal       // Borrow amount converted to USD
+	var borrowedAssetTokenInfo *models.Token     // To get decimals for borrow amount conversion
+
+	baseAssetAddress := goEthereumCommon.HexToAddress(marketFromDB.BaseTokenAddress)
+	quoteAssetAddress := goEthereumCommon.HexToAddress(marketFromDB.QuoteTokenAddress)
+
+	baseAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, baseAssetAddress, marketFromDB.BaseTokenSymbol)
+	if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for base asset %s: %v", marketFromDB.BaseTokenSymbol, err)) }
+	if baseAssetPriceUSD_dec.IsZero() { return NewError(http.StatusInternalServerError, fmt.Sprintf("Oracle price for base asset %s is zero.", marketFromDB.BaseTokenSymbol))}
+
+	quoteAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, quoteAssetAddress, marketFromDB.QuoteTokenSymbol)
+	if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for quote asset %s: %v", marketFromDB.QuoteTokenSymbol, err)) }
+	if quoteAssetPriceUSD_dec.IsZero() { return NewError(http.StatusInternalServerError, fmt.Sprintf("Oracle price for quote asset %s is zero.", marketFromDB.QuoteTokenSymbol))}
 	
-	// --- Projected Account State for Validation ---
-	projectedAssetsTotalUSD_dec := currentAssetsUSD_dec.Add(equityContributionUSD_dec).Add(borrowAmountUSD_dec)
+	positionBaseAmountDecimal := amountDecimal // req.Amount already converted to amountDecimal
+	positionValueQuoteDecimal := positionBaseAmountDecimal.Mul(priceDecimal) // Total value of the position in quote asset terms
+
+	if req.Side == "buy" { // Buying base asset (Long) -> User provides collateral, borrows more of the quote asset to complete the purchase
+		borrowAssetAddress = quoteAssetAddress
+		borrowedAssetTokenInfo, _ = models.TokenDao.GetTokenByAddress(borrowAssetAddress.Hex())
+		if borrowedAssetTokenInfo == nil { return NewError(http.StatusInternalServerError, "Could not find quote token details for borrow.")}
+
+		var equityContributionInQuoteDecimal decimal.Decimal
+		if collateralAssetAddress == quoteAssetAddress {
+			equityContributionInQuoteDecimal = collateralAmountDecimal
+		} else if collateralAssetAddress == baseAssetAddress {
+			// Collateral is base asset, convert its value to quote asset terms.
+			baseAssetPriceInQuote, sdkErr := sdk_wrappers.GetOraclePriceInQuote(hydroSDK, baseAssetAddress, quoteAssetAddress)
+			if sdkErr != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get relative price for base collateral in quote: %v", sdkErr)) }
+			equityContributionInQuoteDecimal = collateralAmountDecimal.Mul(baseAssetPriceInQuote)
+		} else { // Collateral is a third-party asset
+			collateralPriceInQuote, sdkErr := sdk_wrappers.GetOraclePriceInQuote(hydroSDK, collateralAssetAddress, quoteAssetAddress)
+			if sdkErr != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get relative price for collateral %s in quote: %v", req.CollateralAssetSymbol, sdkErr)) }
+			equityContributionInQuoteDecimal = collateralAmountDecimal.Mul(collateralPriceInQuote)
+		}
+
+		// Total quote needed for the position - equity user contributes in quote terms
+		borrowAmountNativeDecimal = positionValueQuoteDecimal.Sub(equityContributionInQuoteDecimal)
+		if borrowAmountNativeDecimal.IsNegative() { // User's collateral (in quote terms) is more than position value
+			borrowAmountNativeDecimal = decimal.Zero
+		}
+		borrowAmountUSD_dec = borrowAmountNativeDecimal.Mul(quoteAssetPriceUSD_dec)
+
+	} else { // Selling base asset (Short) -> User provides collateral, borrows the base asset to sell
+		borrowAssetAddress = baseAssetAddress
+		borrowedAssetTokenInfo, _ = models.TokenDao.GetTokenByAddress(borrowAssetAddress.Hex())
+		if borrowedAssetTokenInfo == nil { return NewError(http.StatusInternalServerError, "Could not find base token details for borrow.")}
+		
+		var equityContributionInBaseDecimal decimal.Decimal
+		if collateralAssetAddress == baseAssetAddress {
+			equityContributionInBaseDecimal = collateralAmountDecimal
+		} else if collateralAssetAddress == quoteAssetAddress {
+			// Collateral is quote asset, convert its value to base asset terms.
+			quoteAssetPriceInBase, sdkErr := sdk_wrappers.GetOraclePriceInQuote(hydroSDK, quoteAssetAddress, baseAssetAddress)
+			if sdkErr != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get relative price for quote collateral in base: %v", sdkErr)) }
+			equityContributionInBaseDecimal = collateralAmountDecimal.Mul(quoteAssetPriceInBase)
+		} else { // Collateral is a third-party asset
+			collateralPriceInBase, sdkErr := sdk_wrappers.GetOraclePriceInQuote(hydroSDK, collateralAssetAddress, baseAssetAddress)
+			if sdkErr != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get relative price for collateral %s in base: %v", req.CollateralAssetSymbol, sdkErr)) }
+			equityContributionInBaseDecimal = collateralAmountDecimal.Mul(collateralPriceInBase)
+		}
+		
+		// Amount of base asset user needs to borrow = Total base asset to sell - base equity they put up
+		borrowAmountNativeDecimal = positionBaseAmountDecimal.Sub(equityContributionInBaseDecimal)
+		if borrowAmountNativeDecimal.IsNegative() { // User's collateral (in base terms) is more than position size
+			borrowAmountNativeDecimal = decimal.Zero
+		}
+		borrowAmountUSD_dec = borrowAmountNativeDecimal.Mul(baseAssetPriceUSD_dec)
+	}
+
+	if borrowAmountNativeDecimal.Sign() <= 0 {
+		borrowAmountUSD_dec = decimal.Zero // Ensure USD amount is also zero if no native borrow
+		borrowAmountNativeDecimal = decimal.Zero // Ensure native is also zero
+		utils.Info("Calculated zero or negative borrow amount. No borrow action will be added.")
+	}
+	
+	// --- Projected Account State for Validation (using precise borrowAmountUSD_dec) ---
+	// Collateral being added is equityContributionUSD_dec
+	projectedAssetsTotalUSD_dec := currentAssetsUSD_dec.Add(equityContributionUSD_dec).Add(borrowAmountUSD_dec) 
 	projectedDebtsTotalUSD_dec := currentDebtsUSD_dec.Add(borrowAmountUSD_dec)
 	
 	var projectedMarginRatio_dec decimal.Decimal
@@ -214,68 +290,45 @@ func OpenMarginPosition(c echo.Context) error {
 	})
 	utils.Info("Prepared Action 1: Transfer Collateral (%s %s) for market %s", req.CollateralAmount, req.CollateralAssetSymbol, marketFromDB.ID)
 
-	// Action 2: Borrow Asset
-	// TODO: This is where the precise borrow amount calculation is CRITICAL.
-	// The `borrowAmountUSD_dec` used in validation is an estimate.
-	// The actual amount to borrow in terms of base/quote asset needs to be calculated here.
-	var borrowAssetAddress goEthereumCommon.Address
-	var borrowAmountBigInt *big.Int
-	var borrowedAssetToken *models.Token
+	// Action 2: Borrow Asset (using precise borrowAmountNativeDecimal)
+	if borrowAmountNativeDecimal.Sign() > 0 {
+		// Fetch decimals for the borrow asset to correctly scale the amount
+		var decimalsForBorrowAsset int
+		tempBorrowedAssetTokenInfo, tokenErr := models.TokenDao.FindByAddress(borrowAssetAddress.Hex())
+		if tokenErr != nil || tempBorrowedAssetTokenInfo == nil {
+			utils.Warningf("OpenMarginPosition: Token info not found in DB for borrow asset %s (Addr: %s), attempting to fetch decimals from chain. DB Error: %v", 
+				borrowedAssetTokenInfo.Symbol, // borrowedAssetTokenInfo might be nil here if GetTokenByAddress failed before, use symbol from earlier if possible or address
+				borrowAssetAddress.Hex(), 
+				tokenErr)
+			
+			decimalsInt32, errChainDecimals := sdk_wrappers.GetTokenDecimals(hydroSDK, borrowAssetAddress)
+			if errChainDecimals != nil {
+				utils.Warningf("OpenMarginPosition: Failed to get decimals for borrow asset %s from chain: %v. Defaulting to 18.", borrowAssetAddress.Hex(), errChainDecimals)
+				decimalsForBorrowAsset = 18 // Default if chain call also fails
+			} else {
+				decimalsForBorrowAsset = int(decimalsInt32)
+			}
+			// For logging symbol later if needed, create a temporary minimal token info
+			if borrowedAssetTokenInfo == nil { // If it was nil from the initial fetch by address
+                 borrowedAssetTokenInfo = &models.Token{Symbol: "UNKNOWN_BORROW_ASSET", Address: borrowAssetAddress.Hex(), Decimals: decimalsForBorrowAsset}
+            } else { // If it was found earlier but FindByAddress failed for some reason, update decimals
+				borrowedAssetTokenInfo.Decimals = decimalsForBorrowAsset
+			}
+		} else {
+			decimalsForBorrowAsset = tempBorrowedAssetTokenInfo.Decimals
+			borrowedAssetTokenInfo = tempBorrowedAssetTokenInfo // Ensure we use the successfully fetched info
+		}
 
-	positionBaseAmountDecimal := amountDecimal
-	positionQuoteValueDecimal := positionBaseAmountDecimal.Mul(priceDecimal)
+		if borrowedAssetTokenInfo == nil { // Still nil after all attempts (should be covered by default above)
+             return NewError(http.StatusInternalServerError, fmt.Sprintf("Critical error: Could not determine token info or decimals for borrow asset %s", borrowAssetAddress.Hex()))
+        }
 
-	if req.Side == "buy" { 
-		borrowAssetAddress = goEthereumCommon.HexToAddress(marketFromDB.QuoteTokenAddress)
-		borrowedAssetToken, _ = models.TokenDao.GetTokenByAddress(marketFromDB.QuoteTokenAddress)
-		if borrowedAssetToken == nil { return NewError(http.StatusInternalServerError, "Could not find quote token details for borrow.")}
+		// Convert native decimal amount to *big.Int using token's decimals
+		borrowAmountWei := utils.DecimalToBigInt(borrowAmountNativeDecimal, int32(decimalsForBorrowAsset))
+		utils.Infof("OpenMarginPosition: Determined borrow of asset %s (Symbol: %s), amount (native decimal): %s, amount (wei): %s, decimals: %d",
+			borrowAssetAddress.Hex(), borrowedAssetTokenInfo.Symbol, borrowAmountNativeDecimal.String(), borrowAmountWei.String(), decimalsForBorrowAsset)
 		
-		var equityInQuoteTokenDecimal decimal.Decimal
-		if collateralAssetAddress == borrowAssetAddress { 
-			equityInQuoteTokenDecimal = equityContributionDecimal
-		} else { 
-			// Collateral is Base, convert its value to Quote. Requires baseAssetPriceUSD.
-			baseAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, goEthereumCommon.HexToAddress(marketFromDB.BaseTokenAddress), marketFromDB.BaseTokenSymbol)
-			if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for base asset %s: %v", marketFromDB.BaseTokenSymbol, err)) }
-			if priceDecimal.IsZero() {return NewError(http.StatusInternalServerError, "Base asset price cannot be zero for this calculation.")} // Should use quote price from oracle
-            quoteAssetPriceUSD_dec, err := getPriceUSD(hydroSDK, goEthereumCommon.HexToAddress(marketFromDB.QuoteTokenAddress), marketFromDB.QuoteTokenSymbol)
-            if err != nil { return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for quote asset %s: %v", marketFromDB.QuoteTokenSymbol, err)) }
-            if quoteAssetPriceUSD_dec.IsZero() { return NewError(http.StatusInternalServerError, "Quote asset price is zero, cannot convert collateral value.")}
-
-			equityInQuoteTokenDecimal = equityContributionDecimal.Mul(baseAssetPriceUSD_dec).Div(quoteAssetPriceUSD_dec)
-		}
-		borrowAmountQuoteDecimal := positionQuoteValueDecimal.Sub(equityInQuoteTokenDecimal)
-		if borrowAmountQuoteDecimal.LessThanOrEqual(decimal.Zero) { // If leverage is 1x or collateral covers full position
-		    utils.Info("Calculated zero or negative borrow amount for quote asset. No borrow action needed for this asset.")
-		    borrowAmountBigInt = big.NewInt(0)
-		} else {
-			borrowAmountBigInt = utils.DecimalToBigInt(borrowAmountQuoteDecimal, int32(borrowedAssetToken.Decimals))
-			utils.Infof("Calculated Borrow: Quote Asset %s, Amount %s", borrowedAssetToken.Symbol, borrowAmountQuoteDecimal.StringFixed(borrowedAssetToken.Decimals))
-		}
-	} else { // Selling base asset, so borrowing base asset
-		borrowAssetAddress = goEthereumCommon.HexToAddress(marketFromDB.BaseTokenAddress)
-		borrowedAssetToken, _ = models.TokenDao.GetTokenByAddress(marketFromDB.BaseTokenAddress)
-		if borrowedAssetToken == nil { return NewError(http.StatusInternalServerError, "Could not find base token details for borrow.")}
-
-		var equityInBaseTokenDecimal decimal.Decimal
-		if collateralAssetAddress == borrowAssetAddress { 
-			equityInBaseTokenDecimal = equityContributionDecimal
-		} else { // Collateral is Quote, convert its value to Base terms.
-			if priceDecimal.IsZero() { return NewError(http.StatusBadRequest, "Price cannot be zero for this calculation.")}
-			equityInBaseTokenDecimal = equityContributionDecimal.Div(priceDecimal) 
-		}
-		borrowAmountBaseDecimal := positionBaseAmountDecimal.Sub(equityInBaseTokenDecimal)
-		if borrowAmountBaseDecimal.LessThanOrEqual(decimal.Zero) {
-			utils.Info("Calculated zero or negative borrow amount for base asset. No borrow action needed for this asset.")
-			borrowAmountBigInt = big.NewInt(0)
-		} else {
-			borrowAmountBigInt = utils.DecimalToBigInt(borrowAmountBaseDecimal, int32(borrowedAssetToken.Decimals))
-			utils.Infof("Calculated Borrow: Base Asset %s, Amount %s", borrowedAssetToken.Symbol, borrowAmountBaseDecimal.StringFixed(borrowedAssetToken.Decimals))
-		}
-	}
-	
-	if borrowAmountBigInt != nil && borrowAmountBigInt.Sign() > 0 {
-		encodedBorrowParams, err := sdk_wrappers.EncodeBorrowParamsForBatch(marketFromDB.ID_uint16(), borrowAssetAddress, borrowAmountBigInt)
+		encodedBorrowParams, err := sdk_wrappers.EncodeBorrowParamsForBatch(marketFromDB.ID_uint16(), borrowAssetAddress, borrowAmountWei)
 		if err != nil {
 			utils.Errorf("Failed to encode borrow params for batch: %v", err)
 			return NewError(http.StatusInternalServerError, "Failed to prepare borrow action")
@@ -284,51 +337,30 @@ func OpenMarginPosition(c echo.Context) error {
 			ActionType:    sdk_wrappers.SDKActionTypeBorrow,
 			EncodedParams: encodedBorrowParams,
 		})
-		utils.Info("Prepared Action 2: Borrow Asset")
+		utils.Infof("Prepared Action 2: Borrow Asset %s, Amount (native): %s, Amount (USD): %s",
+			borrowedAssetTokenInfo.Symbol,
+			borrowAmountNativeDecimal.StringFixed(borrowedAssetTokenInfo.Decimals),
+			borrowAmountUSD_dec.StringFixed(2))
 	} else {
 		utils.Info("Skipping borrow action as calculated borrow amount is zero or less.")
 	}
+
 
 	if len(actions) == 0 {
 		return NewError(http.StatusBadRequest, "No actions to perform. This might happen if collateral transfer is the only action and it's zero, or borrow amount is zero.")
 	}
 
-	// --- Get Unsigned Transaction ---
-	if sdk_wrappers.MarginContractAddress == (goEthereumCommon.Address{}) {
-		return NewError(http.StatusInternalServerError, "Margin contract address not initialized")
-	}
-	
-	var marginContractABIForPack abi.ABI 
-	marginContractABIForPack, err = abi.JSON(strings.NewReader(sdk_wrappers.MarginContractABIJsonString))
+	// --- Prepare Unsigned Transaction using SDK Wrapper ---
+	// Value for batch actions is typically 0 unless sending ETH directly to the contract function (not common for token interactions)
+	txValue := big.NewInt(0) 
+	unsignedTxData, err := sdk_wrappers.PrepareBatchActionsTransaction(hydroSDK, actions, userAddress, txValue)
 	if err != nil {
-		return NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
-	}
-
-	packedBatchData, err := marginContractABIForPack.Pack("batch", actions)
-	if err != nil {
-		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions: %v", err))
-	}
-
-	// TODO: Get Nonce, GasPrice, GasLimit from appropriate sources
-	nonce := uint64(0) 
-	gasPrice := big.NewInt(20000000000) // Example: 20 Gwei
-	gasLimit := uint64(1000000)    // Example: 1 Million gas limit for batch
-	chainIdBigInt, _ := hydroSDK.GetChainID(context.Background())
-
-
-	unsignedTxForClient := &common.UnsignedTxDataForClient{
-		From:     userAddress.Hex(),
-		To:       sdk_wrappers.MarginContractAddress.Hex(),
-		Value:    "0", 
-		Data:     goEthereumCommon.Bytes2Hex(packedBatchData),
-		Nonce:    fmt.Sprintf("%d", nonce),
-		GasPrice: gasPrice.String(), 
-		GasLimit: fmt.Sprintf("%d", gasLimit),
-		ChainID:  chainIdBigInt.String(),
+		utils.Errorf("OpenMarginPosition: Failed to prepare batch actions transaction data: %v", err)
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to prepare transaction data: %v", err))
 	}
 	
 	utils.Info("Successfully prepared unsigned transaction for opening margin position.")
-	return c.JSON(http.StatusOK, unsignedTxForClient)
+	return c.JSON(http.StatusOK, unsignedTxData)
 }
 
 // CloseMarginPositionReq defines the request structure for closing a margin position.

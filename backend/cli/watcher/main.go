@@ -121,6 +121,7 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 			quoteBalance, errQuote := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, quoteAssetAddr, user)
 			if errQuote != nil { utils.Warningf("DecreaseCollateral: Error fetching quote balance: %v", errQuote); quoteBalance = big.NewInt(0) }
 			newHasCollateral := (baseBalance.Sign() > 0 || quoteBalance.Sign() > 0)
+			utils.Infof("Watcher/DecreaseCollateral: Post-event balances for user %s, market %d - Base: %s, Quote: %s. newHasCollateral: %t", user.Hex(), eventMarketID_uint16, baseBalance.String(), quoteBalance.String(), newHasCollateral)
 			currentPos, dbErrGet := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
 			if dbErrGet != nil {
 				utils.Errorf("DecreaseCollateral: GetOrCreate error: %v", dbErrGet)
@@ -160,12 +161,28 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 		} else {
 			baseAssetAddr := ethcommon.HexToAddress(marketDBInfo.BaseTokenAddress)
 			quoteAssetAddr := ethcommon.HexToAddress(marketDBInfo.QuoteTokenAddress)
-			baseDebt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
-			quoteDebt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
+			
+			baseDebt, errBaseDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
+			if errBaseDebt != nil { 
+				utils.Warningf("Repay: Error fetching base debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errBaseDebt)
+				baseDebt = big.NewInt(0) 
+			}
+			quoteDebt, errQuoteDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
+			if errQuoteDebt != nil { 
+				utils.Warningf("Repay: Error fetching quote debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errQuoteDebt)
+				quoteDebt = big.NewInt(0)
+			}
 			newHasDebt := (baseDebt.Sign() > 0 || quoteDebt.Sign() > 0)
-			currentPos, _ := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
-			if err := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), eventMarketID_uint16, currentPos.HasCollateral, newHasDebt); err != nil {
-				utils.Errorf("Repay: UpdateActivity error: %v", err)
+			utils.Infof("Watcher/Repay: Post-event debts for user %s, market %d - Base: %s, Quote: %s. newHasDebt: %t", user.Hex(), eventMarketID_uint16, baseDebt.String(), quoteDebt.String(), newHasDebt)
+			
+			currentPos, dbErrGet := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
+			if dbErrGet != nil {
+				utils.Errorf("Repay: GetOrCreate error: %v", dbErrGet)
+				// If we can't get/create, we probably can't update, so might as well return or skip DB update
+			} else {
+				if errUpdate := models.MarginActivePositionDaoSql.UpdateActivity(user.Hex(), eventMarketID_uint16, currentPos.HasCollateral, newHasDebt); errUpdate != nil {
+					utils.Errorf("Repay: UpdateActivity error: %v", errUpdate)
+				}
 			}
 		}
 		
@@ -206,10 +223,18 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 		baseAssetAddr := ethcommon.HexToAddress(marketDBDetails.BaseTokenAddress)
 		quoteAssetAddr := ethcommon.HexToAddress(marketDBDetails.QuoteTokenAddress)
 
-		baseCollateralBal, _ := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, baseAssetAddr, user)
-		quoteCollateralBal, _ := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, quoteAssetAddr, user)
-		baseBorrowedAmt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
-		quoteBorrowedAmt, _ := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
+		baseCollateralBal, errBaseBal := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, baseAssetAddr, user)
+		if errBaseBal != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching base balance for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errBaseBal); baseCollateralBal = big.NewInt(0) }
+		
+		quoteCollateralBal, errQuoteBal := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, quoteAssetAddr, user)
+		if errQuoteBal != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching quote balance for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errQuoteBal); quoteCollateralBal = big.NewInt(0) }
+		
+		baseBorrowedAmt, errBaseDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
+		if errBaseDebt != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching base debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errBaseDebt); baseBorrowedAmt = big.NewInt(0) }
+		
+		quoteBorrowedAmt, errQuoteDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
+		if errQuoteDebt != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching quote debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errQuoteDebt); quoteBorrowedAmt = big.NewInt(0) }
+
 
 		var basePriceStr, quotePriceStr = "0", "0"
 		if baseAssetAddr != (ethcommon.Address{}) {

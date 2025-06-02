@@ -298,10 +298,17 @@ func (s *MarginMonitorService) monitorPositions() {
 					// Continue without some details if marketDBDetails fails
 				}
 
-				baseCollateralBal, _ := sdk_wrappers.MarketBalanceOf(s.hydro, market.MarketID, market.BaseAssetAddress, userAddress)
-				quoteCollateralBal, _ := sdk_wrappers.MarketBalanceOf(s.hydro, market.MarketID, market.QuoteAssetAddress, userAddress)
-				baseBorrowedAmt, _ := sdk_wrappers.GetAmountBorrowed(s.hydro, market.BaseAssetAddress, userAddress, market.MarketID)
-				quoteBorrowedAmt, _ := sdk_wrappers.GetAmountBorrowed(s.hydro, market.QuoteAssetAddress, userAddress, market.MarketID)
+				baseCollateralBal, errBaseBal := sdk_wrappers.MarketBalanceOf(s.hydro, market.MarketID, market.BaseAssetAddress, userAddress)
+				if errBaseBal != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching base balance for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errBaseBal); baseCollateralBal = big.NewInt(0) }
+				
+				quoteCollateralBal, errQuoteBal := sdk_wrappers.MarketBalanceOf(s.hydro, market.MarketID, market.QuoteAssetAddress, userAddress)
+				if errQuoteBal != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching quote balance for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errQuoteBal); quoteCollateralBal = big.NewInt(0) }
+				
+				baseBorrowedAmt, errBaseDebt := sdk_wrappers.GetAmountBorrowed(s.hydro, market.BaseAssetAddress, userAddress, market.MarketID)
+				if errBaseDebt != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching base debt for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errBaseDebt); baseBorrowedAmt = big.NewInt(0) }
+				
+				quoteBorrowedAmt, errQuoteDebt := sdk_wrappers.GetAmountBorrowed(s.hydro, market.QuoteAssetAddress, userAddress, market.MarketID)
+				if errQuoteDebt != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching quote debt for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errQuoteDebt); quoteBorrowedAmt = big.NewInt(0) }
 				
 				basePriceStr := "0"
 				if price, ok := s.currentPrices[market.BaseAssetAddress]; ok { basePriceStr = price.String() }
@@ -345,17 +352,69 @@ func (s *MarginMonitorService) monitorPositions() {
 
 			// Actual Liquidation Trigger (based on contract's direct liquidatable flag)
 			if accountDetails.Liquidatable {
-				utils.Warningf("User %s in market %d IS LIQUIDATABLE (from GetAccountDetails). AssetsUSD: %s, DebtsUSD: %s, Status: %d",
-					userAddress.Hex(), market.MarketID, 
-					accountDetails.AssetsTotalUSDValue.String(), 
-					accountDetails.DebtsTotalUSDValue.String(), 
-					accountDetails.Status)
-				// TODO: Trigger actual liquidation process.
-				// This might involve:
-				// 1. Checking if an auction is already ongoing for this user/market.
-				// 2. If not, preparing parameters for a `liquidateAccount` batch action or a direct SDK call.
-				// 3. Sending this transaction via a designated liquidator wallet.
-				// 4. Logging the liquidation attempt.
+				// Refined Liquidation Logging
+				utils.Warningf("MarginMonitor: User %s in market ID %d IS LIQUIDATABLE. Account Status: %s, Calculated Ratio: %s. AssetsUSD: %s, DebtsUSD: %s. LiquidateRateFactor: %s",
+					userAddress.Hex(),
+					market.MarketID, // MarketSymbol is not in MarketInfoForMonitor, using ID
+					sdk_wrappers.GetAccountStatusString(accountDetails.Status),
+					formatRatio(currentCollateralRatio),
+					accountDetails.AssetsTotalUSDValue.String(),
+					accountDetails.DebtsTotalUSDValue.String(),
+					market.LiquidateRate.String(), // This is the factor like 1.1e18
+				)
+
+				// Implement Liquidation Action Placeholder
+				// TODO: Step 1: Check if an auction for this user/market is already in progress or recently concluded.
+				// This might involve querying an internal state (e.g., a local cache of active auctions being processed by this monitor instance)
+				// or a new SDK wrapper: e.g., isActiveAuction, err := sdk_wrappers.IsAuctionActiveForAccount(s.hydro, userAddress, market.MarketID)
+				// if err != nil { 
+				//     utils.Errorf("MarginMonitor: Error checking for active auction for user %s, market %d: %v", userAddress.Hex(), market.MarketID, err)
+				//     // Decide if to proceed or wait if check fails. For now, assume we might proceed cautiously.
+				// } else if isActiveAuction {
+				//     utils.Infof("MarginMonitor: Auction already active or recently concluded for user %s, market %d. Skipping new liquidation trigger.", userAddress.Hex(), market.MarketID)
+				//     return // or continue to next user, depending on design
+				// }
+				utils.Infof("MarginMonitor: Conceptually, no active auction found for user %s, market %d. Proceeding with liquidation consideration.", userAddress.Hex(), market.MarketID)
+
+				utils.Infof("MarginMonitor: TODO - Step 2: Prepare conceptual liquidation transaction for user %s, market %d.", userAddress.Hex(), market.MarketID)
+				// // 2.1. Create SDKBatchAction for liquidateAccount
+				// //      - This would require a new sdk_wrappers.EncodeLiquidateAccountParamsForBatch(userAddress, market.MarketID)
+				// //      - Or, if liquidateAccount is not part of batch, a direct sdk_wrapper.PrepareLiquidateAccountTransaction(...)
+				// conceptualEncodedLiquidateParams, encErr := sdk_wrappers.EncodeLiquidateAccountParamsForBatch(userAddress, market.MarketID) // This function needs to be created
+				// if encErr != nil {
+				//     utils.Errorf("MarginMonitor: Conceptually failed to encode liquidate params for user %s, market %d: %v", userAddress.Hex(), market.MarketID, encErr)
+				//     // return or continue
+				// }
+				// actions := []sdk_wrappers.SDKBatchAction{
+				//     {
+				//         ActionType:    sdk_wrappers.SDKActionTypeLiquidate, // SDKActionTypeLiquidate NEEDS TO BE ADDED to SDK Wrappers
+				//         EncodedParams: conceptualEncodedLiquidateParams,
+				//     },
+				// }
+
+				// // 2.2. Get Unsigned Transaction Data (using a pre-configured liquidator EOA)
+				// liquidatorAddressStr := os.Getenv("HSK_LIQUIDATOR_ADDRESS") 
+				// if liquidatorAddressStr == "" {
+				//      utils.Errorf("MarginMonitor: HSK_LIQUIDATOR_ADDRESS is not set. Cannot prepare liquidation tx.")
+				//      // return or continue
+				// }
+				// liquidatorAddress := common.HexToAddress(liquidatorAddressStr)
+				// unsignedTxData, prepErr := sdk_wrappers.PrepareBatchActionsTransaction(s.hydro, actions, liquidatorAddress, big.NewInt(0))
+				// if prepErr != nil {
+				//     utils.Errorf("MarginMonitor: Conceptually failed to prepare liquidation tx for user %s, market %d: %v", userAddress.Hex(), market.MarketID, prepErr)
+				//      // return or continue
+				// }
+				
+				// // 3. Sign and Broadcast (if monitor handles this directly) OR Publish to dedicated queue
+				utils.Warningf("MarginMonitor: TODO - Step 3: Actually sign and broadcast liquidation for user %s, market %d, OR publish to dedicated liquidation queue.", userAddress.Hex(), market.MarketID)
+				// // Example if publishing:
+				// // liquidationTask := map[string]interface{}{"user": userAddress.Hex(), "marketID": market.MarketID, "unsignedTxData": unsignedTxData} // Or just user/marketID
+				// // errPublish := messagebus.PublishToQueue(s.redisClient.Client, "LIQUIDATION_JOB_QUEUE", liquidationTask) // Example queue name
+				// // if errPublish != nil {
+				// //    utils.Errorf("MarginMonitor: Failed to publish liquidation task for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errPublish)
+				// // } else {
+				// //    utils.Infof("MarginMonitor: Published liquidation task for user %s, market %d to queue.", userAddress.Hex(), market.MarketID)
+				// // }
 			}
 		}
 	}
