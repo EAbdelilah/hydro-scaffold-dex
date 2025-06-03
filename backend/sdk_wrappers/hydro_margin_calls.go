@@ -292,10 +292,13 @@ const (
 	SDKActionTypeTransfer           SDKActionType = 2
 	SDKActionTypeBorrow             SDKActionType = 3
 	SDKActionTypeRepay              SDKActionType = 4
-	SDKActionTypeLiquidate          SDKActionType = 5
-	SDKActionTypeLiquidate          SDKActionType = 5 // For initiating liquidation of an account. Note: Ensure this value is unique and correct.
-	SDKActionTypeAuctionPlaceBid    SDKActionType = 6
-	SDKActionTypeAuctionClaim       SDKActionType = 7
+	SDKActionTypeSupply             SDKActionType = 5 // Matches BatchActions.ActionType.Supply
+	SDKActionTypeUnsupply           SDKActionType = 6 // Matches BatchActions.ActionType.Unsupply
+	// The following ActionTypes are not standard in BatchActions.sol and should not be used with the generic Hydro.batch() call.
+	// If these operations (Liquidation, Auction Bidding/Claiming) are implemented, they likely require direct calls to specific smart contract functions, not batching through BatchActions.ActionType.
+	// SDKActionTypeLiquidate          SDKActionType = 7 // Example: if it were a direct mapping (originally 5 before Supply/Unsupply)
+	// SDKActionTypeAuctionPlaceBid    SDKActionType = 8 // Example (originally 6)
+	// SDKActionTypeAuctionClaim       SDKActionType = 9 // Example (originally 7)
 )
 
 // SDKBalanceCategory represents the category of a balance.
@@ -933,7 +936,10 @@ func GenerateMarginOrderDataHex(
 	binary.BigEndian.PutUint16(orderDataBytes[10:12], uint16(takerFeeRateInt))
 
 	// makerRebateRate (2 bytes, uint16, rate * 100000) [12:13]
-	makerRebateRateInt := makerRebateRate.Mul(decimal.NewFromInt(100000)).IntPart()
+	// Solidity's OrderParam.getMakerRebateRateFromOrderData uses min(value, Consts.REBATE_RATE_BASE()) where REBATE_RATE_BASE is 100.
+	// This means the packed uint16 value should represent the rebate as a percentage scaled by 1 (e.g., 1 for 1%, 50 for 50%).
+	// If makerRebateRate (decimal.Decimal) is a fraction (e.g., 0.01 for 1%), scale by 100.
+	makerRebateRateInt := makerRebateRate.Mul(decimal.NewFromInt(100)).IntPart()
 	binary.BigEndian.PutUint16(orderDataBytes[12:14], uint16(makerRebateRateInt))
 
 	// salt (8 bytes, uint64) [14:21]
@@ -1030,92 +1036,95 @@ func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginP
 	}
 
 	// 2. Attempt to fetch InitialMarginFraction directly from chain.
-	// DEVELOPER NOTE: This relies on the user/integrator providing the complete and correct MarginContractABIJsonString.
+	// Section for fetching InitialMarginFraction directly from chain commented out as 'getInitialMarginFraction(marketID)'
+	// is not found in the provided MarginContractABI or Hydro ABI. System will rely on DB or derivation.
 	imrSourcedFromChain := false
-	imrMethodName := "getInitialMarginFraction" // Standardized name, could be different in actual ABI
-	imrMethod, imrMethodExists := marginContractABI.Methods[imrMethodName]
+	// imrMethodName := "getInitialMarginFraction" // Standardized name, could be different in actual ABI
+	// imrMethod, imrMethodExists := marginContractABI.Methods[imrMethodName]
 
-	if imrMethodExists {
-		imrArgsToPack := []interface{}{marketID} // Assuming it takes marketID
-		imrPackedInput, packErr := imrMethod.Inputs.Pack(imrArgsToPack...)
-		if packErr == nil {
-			imrCallData := append(imrMethod.ID, imrPackedInput...)
-			imrResultBytes, imrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: imrCallData}, nil)
-			if imrCallErr == nil && len(imrResultBytes) > 0 {
-				var imrBigInt *big.Int
-				// Assuming the method returns a single uint256 value. Adjust if it returns a struct/tuple.
-				unpackResults, unpackErr := imrMethod.Outputs.Unpack(imrResultBytes)
-				if unpackErr == nil && len(unpackResults) > 0 {
-					imrBigInt, ok = unpackResults[0].(*big.Int)
-					if ok && imrBigInt != nil {
-						imrCandidate := decimal.NewFromBigInt(imrBigInt, -18) // Assuming 1e18 scaled
-						if imrCandidate.IsPositive() && imrCandidate.LessThan(decimal.NewFromInt(1)) {
-							params.InitialMarginFraction = imrCandidate
-							imrSourcedFromChain = true
-							utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction sourced from CHAIN: %s", marketID, params.InitialMarginFraction.String())
-						} else {
-							utils.Warningf("GetMarketMarginParameters for marketID %d: IMR from chain (%s) is invalid. Will try DB/Derivation.", marketID, imrCandidate.String())
-						}
-					} else {
-						utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to assert IMR from chain to *big.Int. Type was %T. Raw: %s", marketID, unpackResults[0], hexutil.Encode(imrResultBytes))
-					}
-				} else if unpackErr != nil {
-					utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s output: %v. Raw: %s", marketID, imrMethodName, unpackErr, hexutil.Encode(imrResultBytes))
-				}
-			} else if imrCallErr != nil {
-				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s failed: %v. Will try DB/Derivation.", marketID, imrMethodName, imrCallErr)
-			} else if len(imrResultBytes) == 0 && imrMethod.Outputs.Length() > 0 {
-				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s returned no data. Will try DB/Derivation.", marketID, imrMethodName)
-			}
-		} else {
-			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v. Will try DB/Derivation.", marketID, imrMethodName, packErr)
-		}
-	} else {
-		utils.Infof("GetMarketMarginParameters for marketID %d: Method %s not found in ABI. Will try DB/Derivation for IMR.", marketID, imrMethodName)
-	}
+	// if imrMethodExists {
+	// 	imrArgsToPack := []interface{}{marketID} // Assuming it takes marketID
+	// 	imrPackedInput, packErr := imrMethod.Inputs.Pack(imrArgsToPack...)
+	// 	if packErr == nil {
+	// 		imrCallData := append(imrMethod.ID, imrPackedInput...)
+	// 		imrResultBytes, imrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: imrCallData}, nil)
+	// 		if imrCallErr == nil && len(imrResultBytes) > 0 {
+	// 			var imrBigInt *big.Int
+	// 			// Assuming the method returns a single uint256 value. Adjust if it returns a struct/tuple.
+	// 			unpackResults, unpackErr := imrMethod.Outputs.Unpack(imrResultBytes)
+	// 			if unpackErr == nil && len(unpackResults) > 0 {
+	// 				imrBigInt, ok = unpackResults[0].(*big.Int)
+	// 				if ok && imrBigInt != nil {
+	// 					imrCandidate := decimal.NewFromBigInt(imrBigInt, -18) // Assuming 1e18 scaled
+	// 					if imrCandidate.IsPositive() && imrCandidate.LessThan(decimal.NewFromInt(1)) {
+	// 						params.InitialMarginFraction = imrCandidate
+	// 						imrSourcedFromChain = true
+	// 						utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction sourced from CHAIN: %s", marketID, params.InitialMarginFraction.String())
+	// 					} else {
+	// 						utils.Warningf("GetMarketMarginParameters for marketID %d: IMR from chain (%s) is invalid. Will try DB/Derivation.", marketID, imrCandidate.String())
+	// 					}
+	// 				} else {
+	// 					utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to assert IMR from chain to *big.Int. Type was %T. Raw: %s", marketID, unpackResults[0], hexutil.Encode(imrResultBytes))
+	// 				}
+	// 			} else if unpackErr != nil {
+	// 				utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s output: %v. Raw: %s", marketID, imrMethodName, unpackErr, hexutil.Encode(imrResultBytes))
+	// 			}
+	// 		} else if imrCallErr != nil {
+	// 			utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s failed: %v. Will try DB/Derivation.", marketID, imrMethodName, imrCallErr)
+	// 		} else if len(imrResultBytes) == 0 && imrMethod.Outputs.Length() > 0 {
+	// 			utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s returned no data. Will try DB/Derivation.", marketID, imrMethodName)
+	// 		}
+	// 	} else {
+	// 		utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v. Will try DB/Derivation.", marketID, imrMethodName, packErr)
+	// 	}
+	// } else {
+	// 	utils.Infof("GetMarketMarginParameters for marketID %d: Method %s not found in ABI. Will try DB/Derivation for IMR.", marketID, imrMethodName)
+	// }
 
 	// 3. Attempt to fetch MaintenanceMarginFraction directly from chain.
+	// Section for fetching MaintenanceMarginFraction directly from chain commented out as 'getMaintenanceMarginFraction(marketID)'
+	// is not found in the provided MarginContractABI or Hydro ABI. System will rely on DB or derivation.
 	mmrSourcedFromChain := false
-	mmrMethodName := "getMaintenanceMarginFraction" // Standardized name
-	mmrMethod, mmrMethodExists := marginContractABI.Methods[mmrMethodName]
+	// mmrMethodName := "getMaintenanceMarginFraction" // Standardized name
+	// mmrMethod, mmrMethodExists := marginContractABI.Methods[mmrMethodName]
 
-	if mmrMethodExists {
-		mmrArgsToPack := []interface{}{marketID} // Assuming it takes marketID
-		mmrPackedInput, packErr := mmrMethod.Inputs.Pack(mmrArgsToPack...)
-		if packErr == nil {
-			mmrCallData := append(mmrMethod.ID, mmrPackedInput...)
-			mmrResultBytes, mmrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: mmrCallData}, nil)
-			if mmrCallErr == nil && len(mmrResultBytes) > 0 {
-				var mmrBigInt *big.Int
-				unpackResults, unpackErr := mmrMethod.Outputs.Unpack(mmrResultBytes)
-				if unpackErr == nil && len(unpackResults) > 0 {
-					mmrBigInt, ok = unpackResults[0].(*big.Int)
-					if ok && mmrBigInt != nil {
-						mmrCandidate := decimal.NewFromBigInt(mmrBigInt, -18) // Assuming 1e18 scaled
-						if mmrCandidate.IsPositive() && mmrCandidate.LessThan(decimal.NewFromInt(1)) {
-							params.MaintenanceMarginFraction = mmrCandidate
-							mmrSourcedFromChain = true
-							utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction sourced from CHAIN: %s", marketID, params.MaintenanceMarginFraction.String())
-						} else {
-							utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from chain (%s) is invalid. Will try DB/Derivation.", marketID, mmrCandidate.String())
-						}
-					} else {
-						utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to assert MMR from chain to *big.Int. Type was %T. Raw: %s", marketID, unpackResults[0], hexutil.Encode(mmrResultBytes))
-					}
-				} else if unpackErr != nil {
-					utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s output: %v. Raw: %s", marketID, mmrMethodName, unpackErr, hexutil.Encode(mmrResultBytes))
-				}
-			} else if mmrCallErr != nil {
-				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s failed: %v. Will try DB/Derivation.", marketID, mmrMethodName, mmrCallErr)
-			} else if len(mmrResultBytes) == 0 && mmrMethod.Outputs.Length() > 0 {
-				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s returned no data. Will try DB/Derivation.", marketID, mmrMethodName)
-			}
-		} else {
-			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v. Will try DB/Derivation.", marketID, mmrMethodName, packErr)
-		}
-	} else {
-		utils.Infof("GetMarketMarginParameters for marketID %d: Method %s not found in ABI. Will try DB/Derivation for MMR.", marketID, mmrMethodName)
-	}
+	// if mmrMethodExists {
+	// 	mmrArgsToPack := []interface{}{marketID} // Assuming it takes marketID
+	// 	mmrPackedInput, packErr := mmrMethod.Inputs.Pack(mmrArgsToPack...)
+	// 	if packErr == nil {
+	// 		mmrCallData := append(mmrMethod.ID, mmrPackedInput...)
+	// 		mmrResultBytes, mmrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: mmrCallData}, nil)
+	// 		if mmrCallErr == nil && len(mmrResultBytes) > 0 {
+	// 			var mmrBigInt *big.Int
+	// 			unpackResults, unpackErr := mmrMethod.Outputs.Unpack(mmrResultBytes)
+	// 			if unpackErr == nil && len(unpackResults) > 0 {
+	// 				mmrBigInt, ok = unpackResults[0].(*big.Int)
+	// 				if ok && mmrBigInt != nil {
+	// 					mmrCandidate := decimal.NewFromBigInt(mmrBigInt, -18) // Assuming 1e18 scaled
+	// 					if mmrCandidate.IsPositive() && mmrCandidate.LessThan(decimal.NewFromInt(1)) {
+	// 						params.MaintenanceMarginFraction = mmrCandidate
+	// 						mmrSourcedFromChain = true
+	// 						utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction sourced from CHAIN: %s", marketID, params.MaintenanceMarginFraction.String())
+	// 					} else {
+	// 						utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from chain (%s) is invalid. Will try DB/Derivation.", marketID, mmrCandidate.String())
+	// 					}
+	// 				} else {
+	// 					utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to assert MMR from chain to *big.Int. Type was %T. Raw: %s", marketID, unpackResults[0], hexutil.Encode(mmrResultBytes))
+	// 				}
+	// 			} else if unpackErr != nil {
+	// 				utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s output: %v. Raw: %s", marketID, mmrMethodName, unpackErr, hexutil.Encode(mmrResultBytes))
+	// 			}
+	// 		} else if mmrCallErr != nil {
+	// 			utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s failed: %v. Will try DB/Derivation.", marketID, mmrMethodName, mmrCallErr)
+	// 		} else if len(mmrResultBytes) == 0 && mmrMethod.Outputs.Length() > 0 {
+	// 			utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s returned no data. Will try DB/Derivation.", marketID, mmrMethodName)
+	// 		}
+	// 	} else {
+	// 		utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v. Will try DB/Derivation.", marketID, mmrMethodName, packErr)
+	// 	}
+	// } else {
+	// 	utils.Infof("GetMarketMarginParameters for marketID %d: Method %s not found in ABI. Will try DB/Derivation for MMR.", marketID, mmrMethodName)
+	// }
 
 	// 4. Fallback to Database if IMR or MMR not successfully sourced from chain.
 	var marketDBRecord *models.Market
