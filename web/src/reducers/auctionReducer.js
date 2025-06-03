@@ -4,9 +4,9 @@ import { HANDLE_AUCTION_UPDATE } from '../actions/auctionActions';
 const initialState = fromJS({
   // Stores auctions keyed by marketID, then by auctionID
   // e.g., { "ETH-DAI": { "auctionId123": { ...details... } } }
-  auctionsByMarketIdAuctionId: {}, 
+  auctionsByMarketIdAuctionId: {},
   // Could also have separate lists for active/finished auctions if complex queries are frequent
-  // activeAuctions: List(), 
+  // activeAuctions: List(),
   // finishedAuctions: List(),
 });
 
@@ -29,7 +29,7 @@ export default function auctionReducer(state = initialState, action) {
       }
       return state;
     }
-    
+
     // Example for fetching a list of auctions (if FETCH_AUCTIONS_SUCCESS was implemented)
     // case 'auctions/FETCH_AUCTIONS_SUCCESS': {
     //   const { marketID, auctions } = action.payload;

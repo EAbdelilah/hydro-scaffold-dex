@@ -11,18 +11,22 @@ export const FETCH_MARGIN_ACCOUNT_DETAILS_SUCCESS = 'margin/FETCH_MARGIN_ACCOUNT
 export const FETCH_MARGIN_ACCOUNT_DETAILS_FAILURE = 'margin/FETCH_MARGIN_ACCOUNT_DETAILS_FAILURE';
 
 export const DEPOSIT_COLLATERAL_REQUEST = 'margin/DEPOSIT_COLLATERAL_REQUEST';
-export const DEPOSIT_COLLATERAL_SUCCESS = 'margin/DEPOSIT_COLLATERAL_SUCCESS';
+export const DEPOSIT_COLLATERAL_UNSIGNED_TX_RECEIVED = 'margin/DEPOSIT_COLLATERAL_UNSIGNED_TX_RECEIVED';
+export const DEPOSIT_COLLATERAL_SUCCESS = 'margin/DEPOSIT_COLLATERAL_SUCCESS'; // Kept for optimistic updates or direct calls if ever needed
 export const DEPOSIT_COLLATERAL_FAILURE = 'margin/DEPOSIT_COLLATERAL_FAILURE';
 
 export const WITHDRAW_COLLATERAL_REQUEST = 'margin/WITHDRAW_COLLATERAL_REQUEST';
+export const WITHDRAW_COLLATERAL_UNSIGNED_TX_RECEIVED = 'margin/WITHDRAW_COLLATERAL_UNSIGNED_TX_RECEIVED';
 export const WITHDRAW_COLLATERAL_SUCCESS = 'margin/WITHDRAW_COLLATERAL_SUCCESS';
 export const WITHDRAW_COLLATERAL_FAILURE = 'margin/WITHDRAW_COLLATERAL_FAILURE';
 
 export const BORROW_LOAN_REQUEST = 'margin/BORROW_LOAN_REQUEST';
+export const BORROW_LOAN_UNSIGNED_TX_RECEIVED = 'margin/BORROW_LOAN_UNSIGNED_TX_RECEIVED';
 export const BORROW_LOAN_SUCCESS = 'margin/BORROW_LOAN_SUCCESS';
 export const BORROW_LOAN_FAILURE = 'margin/BORROW_LOAN_FAILURE';
 
 export const REPAY_LOAN_REQUEST = 'margin/REPAY_LOAN_REQUEST';
+export const REPAY_LOAN_UNSIGNED_TX_RECEIVED = 'margin/REPAY_LOAN_UNSIGNED_TX_RECEIVED';
 export const REPAY_LOAN_SUCCESS = 'margin/REPAY_LOAN_SUCCESS';
 export const REPAY_LOAN_FAILURE = 'margin/REPAY_LOAN_FAILURE';
 
@@ -79,14 +83,14 @@ export const refreshAllMarginDataForUserAndMarket = (marketID, userAddress, coll
   }
   try {
     await dispatch(fetchMarginAccountDetails(marketID, userAddress));
-    if (collateralAssetSymbol) { 
+    if (collateralAssetSymbol) {
       await dispatch(fetchSpendableMarginBalance(marketID, collateralAssetSymbol, userAddress));
     }
-    if (otherAssetSymbol && otherAssetSymbol !== collateralAssetSymbol) { 
+    if (otherAssetSymbol && otherAssetSymbol !== collateralAssetSymbol) {
        await dispatch(fetchSpendableMarginBalance(marketID, otherAssetSymbol, userAddress));
     }
-    await dispatch(fetchOpenPositions(userAddress)); 
-    await dispatch(fetchLoans(marketID, userAddress)); 
+    await dispatch(fetchOpenPositions(userAddress));
+    await dispatch(fetchLoans(marketID, userAddress));
   } catch (error) {
     console.error('Error during refreshAllMarginDataForUserAndMarket:', error);
   }
@@ -94,40 +98,67 @@ export const refreshAllMarginDataForUserAndMarket = (marketID, userAddress, coll
 
 
 const walletService = {
-  signTransaction: async (unsignedTxData, state) => {
-    const wallet = getSelectedAccountWallet(state);
-    if (!wallet || !wallet.provider) {
-      throw new Error('Wallet or provider not available');
+  signTransaction: async (unsignedTxData, getState) => {
+    // Conceptual placeholder for using @gongddex/hydro-sdk-wallet if its signTransaction is suitable
+    // const selectedAccount = getSelectedAccountWallet(getState());
+    // if (selectedAccount && selectedAccount.wallet && typeof selectedAccount.wallet.signTransaction === 'function') {
+    //   console.info("Attempting to sign with hydro-sdk-wallet (if method matches)...");
+    //   // TODO: Adapt unsignedTxData to the format expected by selectedAccount.wallet.signTransaction()
+    //   // This might involve different field names or types.
+    //   // const compatibleTx = { ... map unsignedTxData ... };
+    //   // try {
+    //   //   const signedTx = await selectedAccount.wallet.signTransaction(compatibleTx);
+    //   //   return signedTx; // Or extract raw hex if needed
+    //   // } catch (error) {
+    //   //   console.error("hydro-sdk-wallet signing failed, considering fallback or rethrowing:", error);
+    //   // }
+    // }
+
+    // Primary implementation using ethers.js + window.ethereum
+    if (!window.ethereum) {
+      throw new Error("Ethereum wallet (e.g., MetaMask) not detected.");
     }
-    if (window.ethereum && wallet.provider === window.ethereum) {
-      const provider = new ethers.providers.Web3Provider(window.ethereum);
-      const signer = provider.getSigner();
-      const txRequest = {
-        from: unsignedTxData.from,
-        to: unsignedTxData.to,
-        value: ethers.utils.hexlify(ethers.BigNumber.from(unsignedTxData.value || '0')),
-        data: unsignedTxData.data,
-        gasPrice: ethers.utils.hexlify(ethers.BigNumber.from(unsignedTxData.gasPrice || '0')),
-        gasLimit: ethers.utils.hexlify(ethers.BigNumber.from(unsignedTxData.gasLimit || '0')),
-      };
-      if (unsignedTxData.nonce) {
-        txRequest.nonce = ethers.utils.hexlify(ethers.BigNumber.from(unsignedTxData.nonce));
-      } else {
-         txRequest.nonce = await signer.getTransactionCount();
+
+    // ethers is already imported statically at the top of the file.
+    // const ethers = await import('ethers'); // Dynamic import not strictly needed if static
+    const provider = new ethers.providers.Web3Provider(window.ethereum);
+    const signer = provider.getSigner();
+
+    const signerAddress = await signer.getAddress();
+    if (signerAddress.toLowerCase() !== unsignedTxData.from.toLowerCase()) {
+      throw new Error(`Wallet address mismatch. Expected ${unsignedTxData.from}, got ${signerAddress}. Please switch accounts in your wallet.`);
+    }
+
+    const txRequest = {
+      to: unsignedTxData.to,
+      from: unsignedTxData.from, // Required by some signers
+      nonce: ethers.BigNumber.from(unsignedTxData.nonce).toNumber(), // ethers.js v5 expects number for nonce
+      gasPrice: ethers.BigNumber.from(unsignedTxData.gasPrice),
+      gasLimit: ethers.BigNumber.from(unsignedTxData.gasLimit),
+      value: ethers.BigNumber.from(unsignedTxData.value || '0'), // Default value to '0' if not present
+      data: unsignedTxData.data, // Should be 0x-prefixed hex
+      chainId: parseInt(unsignedTxData.chainId)
+    };
+
+    console.log("Prepared transaction request for ethers.js:", txRequest);
+
+    try {
+      // Populate transaction to ensure all fields are correctly formatted for the network/signer
+      // For some versions/cases, signer.signTransaction might not need prior populateTransaction
+      // if the txRequest is already complete. However, populateTransaction is safer.
+      const populatedTx = await signer.populateTransaction(txRequest);
+      console.log("Populated transaction for signing:", populatedTx);
+      const signedRawTxHex = await signer.signTransaction(populatedTx);
+      console.info("Transaction signed successfully via ethers.js:", signedRawTxHex);
+      return signedRawTxHex;
+    } catch (error) {
+      console.error("Ethers.js signing error:", error);
+      if (error.code === 4001 || error.code === 'ACTION_REJECTED') { // Ethers v5 uses ACTION_REJECTED
+        throw new Error("Transaction signature rejected by user.");
       }
-      if (unsignedTxData.chainId) { // Add chainId if present
-        txRequest.chainId = parseInt(unsignedTxData.chainId);
-      }
-      console.log("Signing transaction request:", txRequest);
-      // This is a placeholder for actual signing. 
-      // For MetaMask, signer.sendTransaction() is more common if the wallet also broadcasts.
-      // If backend *must* receive the raw signed tx, then signer.signTransaction() would be used,
-      // but it requires the transaction to be fully populated by the signer, or careful construction.
-      // For now, simulating getting a raw signed transaction hex.
-      alert('Please sign the transaction in your wallet (Simulated)'); 
-      return `0xSIMULATED_SIGNED_RAW_TX_${Date.now()}`;
-    } else {
-      throw new Error('Unsupported wallet provider for signing transaction.');
+      // Attempt to get a more specific message if available
+      const mainReason = error.reason || (error.data ? error.data.message : (error.error ? error.error.message : error.message));
+      throw new Error(mainReason || "Failed to sign transaction with ethers.js.");
     }
   }
 };
@@ -146,14 +177,14 @@ export const openMarginPosition = (params) => async (dispatch, getState) => {
           dispatch(broadcastMarginTransaction(signedTxHex, params.marketID, params.userAddress, params.collateralAssetSymbol, params.baseAssetSymbol, params.quoteAssetSymbol));
         } else {
           dispatch({ type: OPEN_MARGIN_POSITION_FAILURE, payload: { error: 'Transaction signing failed or rejected by user.' } });
-          dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE }); 
+          dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
         }
       } catch (signError) {
         console.error('Signing error:', signError);
         dispatch({ type: OPEN_MARGIN_POSITION_FAILURE, payload: { error: `Transaction signing failed: ${signError.message || signError}` } });
         dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
       }
-      return unsignedTxData; 
+      return unsignedTxData;
     } else {
       const errorMsg = response.data.desc || 'Failed to open margin position';
       dispatch({ type: OPEN_MARGIN_POSITION_FAILURE, payload: { error: errorMsg } });
@@ -176,7 +207,7 @@ export const initiateCloseMarginPosition = (marketID, userAddress, baseAssetSymb
       try {
         const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
         if (signedTxHex) {
-          dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, null, baseAssetSymbol, quoteAssetSymbol)); 
+          dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, null, baseAssetSymbol, quoteAssetSymbol));
         } else {
           dispatch({ type: INITIATE_CLOSE_MARGIN_POSITION_FAILURE, payload: { error: 'Transaction signing failed or rejected by user.' } });
           dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
@@ -199,20 +230,20 @@ export const initiateCloseMarginPosition = (marketID, userAddress, baseAssetSymb
 };
 
 export const broadcastMarginTransaction = (
-    signedRawTxHex, 
-    marketID, 
-    userAddress, 
-    collateralAssetSymbol, 
-    baseAssetSymbol,       
-    quoteAssetSymbol       
+    signedRawTxHex,
+    marketID,
+    userAddress,
+    collateralAssetSymbol,
+    baseAssetSymbol,
+    quoteAssetSymbol
   ) => async (dispatch) => {
   dispatch({ type: BROADCAST_MARGIN_TRANSACTION_REQUEST, payload: { signedRawTxHex } });
   try {
-    const response = await api.broadcastTransaction({ signedRawTx: signedRawTxHex }); 
+    const response = await api.broadcastTransaction({ signedRawTx: signedRawTxHex });
     if (response.data.status === 0 && response.data.data && response.data.data.transactionHash) {
       const txHash = response.data.data.transactionHash;
       dispatch({ type: BROADCAST_MARGIN_TRANSACTION_SUCCESS, payload: { transactionHash: txHash } });
-      dispatch(clearTradeForm()); 
+      dispatch(clearTradeForm());
       let otherAssetForRefresh = baseAssetSymbol === collateralAssetSymbol ? quoteAssetSymbol : baseAssetSymbol;
       if (marketID && userAddress) {
          dispatch(refreshAllMarginDataForUserAndMarket(marketID, userAddress, collateralAssetSymbol, otherAssetForRefresh));
@@ -241,7 +272,7 @@ export const fetchMarginAccountDetails = (marketID, userAddress) => async (dispa
   dispatch({ type: FETCH_MARGIN_ACCOUNT_DETAILS_REQUEST, payload: { marketID, userAddress } });
   try {
     const response = await api.getMarginAccountDetails(marketID, userAddress);
-    if (response && response.data && response.data.data !== undefined) { 
+    if (response && response.data && response.data.data !== undefined) {
       dispatch({ type: FETCH_MARGIN_ACCOUNT_DETAILS_SUCCESS, payload: { marketID, userAddress, details: response.data.data } });
       return response.data.data;
     } else {
@@ -251,46 +282,75 @@ export const fetchMarginAccountDetails = (marketID, userAddress) => async (dispa
     }
   } catch (error) {
     dispatch({ type: FETCH_MARGIN_ACCOUNT_DETAILS_FAILURE, payload: { marketID, userAddress, error: error.message } });
-    throw error; 
-  }
-};
-
-export const depositCollateral = (marketID, assetAddress, amount) => async (dispatch) => {
-  dispatch({ type: DEPOSIT_COLLATERAL_REQUEST, payload: { marketID, assetAddress, amount } });
-  try {
-    const response = await api.depositToCollateral({ marketID, assetAddress, amount: amount.toString() });
-    if (response && response.data && response.data.data !== undefined) {
-      dispatch({ type: DEPOSIT_COLLATERAL_SUCCESS, payload: { marketID, assetAddress, amount, data: response.data.data } });
-      // TODO: Refresh relevant data
-      return response.data.data;
-    } else {
-      const errorMsg = response && response.data && response.data.desc ? response.data.desc : 'Invalid response structure';
-      dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { marketID, assetAddress, amount, error: errorMsg } });
-      throw new Error(errorMsg);
-    }
-  } catch (error) {
-    dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { marketID, assetAddress, amount, error: error.message } });
     throw error;
   }
 };
 
-export const fetchOpenPositions = (userAddress) => async (dispatch) => {
-  dispatch({ type: FETCH_OPEN_POSITIONS_REQUEST, payload: { userAddress } });
+export const depositCollateral = (marketID, userAddress, assetAddress, assetSymbol, amount) => async (dispatch, getState) => {
+  dispatch({ type: DEPOSIT_COLLATERAL_REQUEST, payload: { marketID, assetAddress, amount } });
   try {
-    const response = await api.getOpenPositions(userAddress); 
+    // Assuming api.depositToCollateral now returns unsignedTxData
+    const response = await api.depositToCollateral({ marketID, assetAddress, amount: amount.toString() });
+    if (response.data.status === 0 && response.data.data) {
+      const unsignedTxData = response.data.data;
+      dispatch({ type: DEPOSIT_COLLATERAL_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
+      dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
+      try {
+        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        if (signedTxHex) {
+          // Determine base/quote symbols for refresh from marketID if possible, or pass them if available
+          // For deposit, collateralAssetSymbol is assetSymbol. The other market symbol might be needed.
+          // This part might need adjustment depending on how you get base/quote symbols for refresh.
+          const market = getState().market.markets[marketID];
+          const baseAssetSymbol = market ? market.baseTokenSymbol : null;
+          const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
+          dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
+        } else {
+          dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { error: 'Transaction signing failed or rejected by user.' } });
+          dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+        }
+      } catch (signError) {
+        console.error('Signing error during deposit collateral:', signError);
+        dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { error: `Transaction signing failed: ${signError.message || signError}` } });
+        dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+      }
+      return unsignedTxData;
+    } else {
+      const errorMsg = response.data.desc || 'Failed to initiate deposit collateral';
+      dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { error: errorMsg } });
+      throw new Error(errorMsg);
+    }
+  } catch (error) {
+    dispatch({ type: DEPOSIT_COLLATERAL_FAILURE, payload: { error: error.message } });
+    throw error;
+  }
+};
+
+export const fetchOpenPositions = (userAddress) => async (dispatch, getState) => { // userAddress is still useful for storing data in redux state by user
+  // If userAddress is not passed, try to get it from the selected account in wallet state
+  const effectiveUserAddress = userAddress || (getSelectedAccountWallet(getState())?.address);
+  if (!effectiveUserAddress) {
+    dispatch({ type: FETCH_OPEN_POSITIONS_FAILURE, payload: { error: 'User address not available for fetching open positions.', userAddress: null } });
+    return;
+  }
+
+  dispatch({ type: FETCH_OPEN_POSITIONS_REQUEST, payload: { userAddress: effectiveUserAddress } });
+  try {
+    const response = await api.getOpenPositions(); // API call no longer takes userAddress
     if (response.data.status === 0 && response.data.data) {
       dispatch({
         type: FETCH_OPEN_POSITIONS_SUCCESS,
-        payload: { positions: response.data.data, userAddress } 
+        // Store by effectiveUserAddress for consistency, even if API infers it
+        payload: { positions: response.data.data, userAddress: effectiveUserAddress }
       });
       return response.data.data;
     } else {
       const errorMsg = response.data.desc || 'Failed to fetch open positions';
-      dispatch({ type: FETCH_OPEN_POSITIONS_FAILURE, payload: { error: errorMsg, userAddress } });
+      dispatch({ type: FETCH_OPEN_POSITIONS_FAILURE, payload: { error: errorMsg, userAddress: effectiveUserAddress } });
       throw new Error(errorMsg);
     }
   } catch (error) {
-    dispatch({ type: FETCH_OPEN_POSITIONS_FAILURE, payload: { error: error.message, userAddress } });
+    dispatch({ type: FETCH_OPEN_POSITIONS_FAILURE, payload: { error: error.message, userAddress: effectiveUserAddress } });
     throw error;
   }
 };
@@ -318,12 +378,12 @@ export const fetchSpendableMarginBalance = (marketID, assetSymbol, userAddress) 
 
 export const handleMarginAccountUpdate = (updateData) => ({
   type: HANDLE_MARGIN_ACCOUNT_UPDATE,
-  payload: updateData 
+  payload: updateData
 });
 
 export const handleMarginAlert = (alertData) => ({
   type: HANDLE_MARGIN_ALERT,
-  payload: { ...alertData, id: Date.now() } 
+  payload: { ...alertData, id: Date.now() }
 });
 
 export const dismissMarginAlert = (alertId) => ({
@@ -331,74 +391,139 @@ export const dismissMarginAlert = (alertId) => ({
   payload: { alertId }
 });
 
-export const withdrawCollateral = (marketID, assetAddress, amount) => async (dispatch) => {
+export const withdrawCollateral = (marketID, userAddress, assetAddress, assetSymbol, amount) => async (dispatch, getState) => {
   dispatch({ type: WITHDRAW_COLLATERAL_REQUEST, payload: { marketID, assetAddress, amount } });
   try {
     const response = await api.withdrawFromCollateral({ marketID, assetAddress, amount: amount.toString() });
-    if (response && response.data && response.data.data !== undefined) {
-      dispatch({ type: WITHDRAW_COLLATERAL_SUCCESS, payload: { marketID, assetAddress, amount, data: response.data.data } });
-      return response.data.data;
+    if (response.data.status === 0 && response.data.data) {
+      const unsignedTxData = response.data.data;
+      dispatch({ type: WITHDRAW_COLLATERAL_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
+      dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
+      try {
+        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        if (signedTxHex) {
+          const market = getState().market.markets[marketID];
+          const baseAssetSymbol = market ? market.baseTokenSymbol : null;
+          const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
+          dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
+        } else {
+          dispatch({ type: WITHDRAW_COLLATERAL_FAILURE, payload: { error: 'Transaction signing failed or rejected by user.' } });
+          dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+        }
+      } catch (signError) {
+        console.error('Signing error during withdraw collateral:', signError);
+        dispatch({ type: WITHDRAW_COLLATERAL_FAILURE, payload: { error: `Transaction signing failed: ${signError.message || signError}` } });
+        dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+      }
+      return unsignedTxData;
     } else {
-      const errorMsg = response && response.data && response.data.desc ? response.data.desc : 'Invalid response structure';
-      dispatch({ type: WITHDRAW_COLLATERAL_FAILURE, payload: { marketID, assetAddress, amount, error: errorMsg } });
+      const errorMsg = response.data.desc || 'Failed to initiate withdraw collateral';
+      dispatch({ type: WITHDRAW_COLLATERAL_FAILURE, payload: { error: errorMsg } });
       throw new Error(errorMsg);
     }
   } catch (error) {
-    dispatch({ type: WITHDRAW_COLLATERAL_FAILURE, payload: { marketID, assetAddress, amount, error: error.message } });
+    dispatch({ type: WITHDRAW_COLLATERAL_FAILURE, payload: { error: error.message } });
     throw error;
   }
 };
 
-export const borrowLoanAction = (marketID, assetAddress, amount) => async (dispatch) => {
+export const borrowLoanAction = (marketID, userAddress, assetAddress, assetSymbol, amount) => async (dispatch, getState) => {
   dispatch({ type: BORROW_LOAN_REQUEST, payload: { marketID, assetAddress, amount } });
   try {
     const response = await api.borrowLoan({ marketID, assetAddress, amount: amount.toString() });
-    if (response && response.data && response.data.data !== undefined) {
-      dispatch({ type: BORROW_LOAN_SUCCESS, payload: { marketID, assetAddress, amount, data: response.data.data } });
-      return response.data.data;
+    if (response.data.status === 0 && response.data.data) {
+      const unsignedTxData = response.data.data;
+      dispatch({ type: BORROW_LOAN_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
+      dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
+      try {
+        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        if (signedTxHex) {
+          const market = getState().market.markets[marketID];
+          const baseAssetSymbol = market ? market.baseTokenSymbol : null;
+          const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
+          dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
+        } else {
+          dispatch({ type: BORROW_LOAN_FAILURE, payload: { error: 'Transaction signing failed or rejected by user.' } });
+          dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+        }
+      } catch (signError) {
+        console.error('Signing error during borrow loan:', signError);
+        dispatch({ type: BORROW_LOAN_FAILURE, payload: { error: `Transaction signing failed: ${signError.message || signError}` } });
+        dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+      }
+      return unsignedTxData;
     } else {
-      const errorMsg = response && response.data && response.data.desc ? response.data.desc : 'Invalid response structure';
-      dispatch({ type: BORROW_LOAN_FAILURE, payload: { marketID, assetAddress, amount, error: errorMsg } });
+      const errorMsg = response.data.desc || 'Failed to initiate borrow loan';
+      dispatch({ type: BORROW_LOAN_FAILURE, payload: { error: errorMsg } });
       throw new Error(errorMsg);
     }
   } catch (error) {
-    dispatch({ type: BORROW_LOAN_FAILURE, payload: { marketID, assetAddress, amount, error: error.message } });
+    dispatch({ type: BORROW_LOAN_FAILURE, payload: { error: error.message } });
     throw error;
   }
 };
 
-export const repayLoanAction = (marketID, assetAddress, amount) => async (dispatch) => {
+export const repayLoanAction = (marketID, userAddress, assetAddress, assetSymbol, amount) => async (dispatch, getState) => {
   dispatch({ type: REPAY_LOAN_REQUEST, payload: { marketID, assetAddress, amount } });
   try {
     const response = await api.repayLoan({ marketID, assetAddress, amount: amount.toString() });
-    if (response && response.data && response.data.data !== undefined) {
-      dispatch({ type: REPAY_LOAN_SUCCESS, payload: { marketID, assetAddress, amount, data: response.data.data } });
-      return response.data.data;
+    if (response.data.status === 0 && response.data.data) {
+      const unsignedTxData = response.data.data;
+      dispatch({ type: REPAY_LOAN_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
+      dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
+      try {
+        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        if (signedTxHex) {
+          const market = getState().market.markets[marketID];
+          const baseAssetSymbol = market ? market.baseTokenSymbol : null;
+          const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
+          dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
+        } else {
+          dispatch({ type: REPAY_LOAN_FAILURE, payload: { error: 'Transaction signing failed or rejected by user.' } });
+          dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+        }
+      } catch (signError) {
+        console.error('Signing error during repay loan:', signError);
+        dispatch({ type: REPAY_LOAN_FAILURE, payload: { error: `Transaction signing failed: ${signError.message || signError}` } });
+        dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
+      }
+      return unsignedTxData;
     } else {
-      const errorMsg = response && response.data && response.data.desc ? response.data.desc : 'Invalid response structure';
-      dispatch({ type: REPAY_LOAN_FAILURE, payload: { marketID, assetAddress, amount, error: errorMsg } });
+      const errorMsg = response.data.desc || 'Failed to initiate repay loan';
+      dispatch({ type: REPAY_LOAN_FAILURE, payload: { error: errorMsg } });
       throw new Error(errorMsg);
     }
   } catch (error) {
-    dispatch({ type: REPAY_LOAN_FAILURE, payload: { marketID, assetAddress, amount, error: error.message } });
+    dispatch({ type: REPAY_LOAN_FAILURE, payload: { error: error.message } });
     throw error;
   }
 };
 
-export const fetchLoans = (marketID, userAddress) => async (dispatch) => {
-  dispatch({ type: FETCH_LOANS_REQUEST, payload: { marketID, userAddress } });
+export const fetchLoans = (marketID, userAddress) => async (dispatch, getState) => { // userAddress for redux state, marketID for API
+  // If userAddress is not passed, try to get it from the selected account in wallet state
+  const effectiveUserAddress = userAddress || (getSelectedAccountWallet(getState())?.address);
+  if (!effectiveUserAddress) {
+    dispatch({ type: FETCH_LOANS_FAILURE, payload: { marketID, userAddress: null, error: 'User address not available for fetching loans.' } });
+    return;
+  }
+
+  dispatch({ type: FETCH_LOANS_REQUEST, payload: { marketID, userAddress: effectiveUserAddress } });
   try {
-    const response = await api.getLoans(marketID, userAddress);
-    if (response && response.data && response.data.data !== undefined) {
-      dispatch({ type: FETCH_LOANS_SUCCESS, payload: { marketID, userAddress, loans: response.data.data } }); 
+    const response = await api.getLoans(marketID); // API call takes optional marketID
+    // Assuming backend common response structure: { status: 0, data: [...] }
+    if (response.data.status === 0 && response.data.data) {
+      dispatch({
+        type: FETCH_LOANS_SUCCESS,
+        payload: { marketID, userAddress: effectiveUserAddress, loans: response.data.data }
+      });
       return response.data.data;
     } else {
-      const errorMsg = response && response.data && response.data.desc ? response.data.desc : 'Invalid response structure';
-      dispatch({ type: FETCH_LOANS_FAILURE, payload: { marketID, userAddress, error: errorMsg } });
+      const errorMsg = response.data.desc || 'Failed to fetch loans';
+      dispatch({ type: FETCH_LOANS_FAILURE, payload: { marketID, userAddress: effectiveUserAddress, error: errorMsg } });
       throw new Error(errorMsg);
     }
   } catch (error) {
-    dispatch({ type: FETCH_LOANS_FAILURE, payload: { marketID, userAddress, error: error.message } });
+    dispatch({ type: FETCH_LOANS_FAILURE, payload: { marketID, userAddress: effectiveUserAddress, error: error.message } });
     throw error;
   }
 };

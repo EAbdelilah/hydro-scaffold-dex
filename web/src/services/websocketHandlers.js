@@ -56,7 +56,7 @@ export function onWebSocketMessage(event) {
         console.warn("WebSocket: AUCTION_UPDATE message received without payload.");
       }
       break;
-    
+
     // TODO: Integrate existing WebSocket message handling here if this file becomes the central handler.
     // For example, orderbook updates, spot trade confirmations, etc.
     // case 'ORDERBOOK_SNAPSHOT':
@@ -82,7 +82,7 @@ export function initializeWebSocket() {
 
   const websocketApiUrl = env.WEBSOCKET_API_URL || 'ws://localhost:3002/ws'; // Default if not in env
   console.log(`WebSocket: Initializing connection to ${websocketApiUrl}...`);
-  
+
   ws = new WebSocket(websocketApiUrl);
 
   ws.onopen = () => {

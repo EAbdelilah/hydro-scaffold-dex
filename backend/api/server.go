@@ -54,6 +54,7 @@ func loadRoutes(e *echo.Echo) {
 	addRoute(e, "GET", "/margin/loans", &LoanListReq{}, GetLoans, authMiddleware)
 
 	// Margin Position Routes
+	addRoute(e, "GET", "/v1/margin/positions", &EmptyReq{}, GetUserMarginPositions, authMiddleware) // New route for listing positions
 	addRoute(e, "POST", "/v1/margin/positions/open", &OpenMarginPositionReq{}, OpenMarginPosition, authMiddleware)
 	addRoute(e, "POST", "/v1/margin/positions/close", &CloseMarginPositionReq{}, CloseMarginPosition, authMiddleware)
 }

@@ -47,13 +47,13 @@ export const fetchMarketMarginParameters = marketID => {
     dispatch({ type: FETCH_MARKET_MARGIN_PARAMETERS_REQUEST, payload: { marketID } });
     try {
       // Uses api.getMarketMarginParameters from web/src/lib/api.js
-      const response = await api.getMarketMarginParameters(marketID); 
+      const response = await api.getMarketMarginParameters(marketID);
 
-      if (response.data.status === 0 && response.data.data) { 
+      if (response.data.status === 0 && response.data.data) {
         const parameters = response.data.data; // Direct use of data object
         dispatch({
           type: FETCH_MARKET_MARGIN_PARAMETERS_SUCCESS,
-          payload: { marketID, parameters } 
+          payload: { marketID, parameters }
         });
         return parameters;
       } else {

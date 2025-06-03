@@ -2,14 +2,14 @@ import React, { Component } from 'react';
 import { connect } from 'react-redux';
 import { BigNumber } from 'bignumber.js';
 import { Map } from 'immutable'; // Import Map for marketsData default
-import { 
-  fetchLoans, 
-  initiateRepayLoan 
+import {
+  fetchLoans,
+  initiateRepayLoan
 } from '../../actions/marginActions';
-import { 
+import {
   // Assuming getLoansForMarket is primary, or getAllActiveLoansList if a global list is preferred
-  getLoansForMarket, 
-  getAllActiveLoansList, 
+  getLoansForMarket,
+  getAllActiveLoansList,
   getLoansLoading, // For specific market
   getAnyLoanLoadingState, // For general loading state if fetching all
   getMarginActionError // Using generalized error
@@ -66,7 +66,7 @@ class ActiveLoansList extends Component {
     const { dispatch, userAddress, marketsData } = this.props;
     const marketID = loan.get('marketID');
     const market = marketsData.get(marketID.toString()); // Ensure marketID is string for map key
-    
+
     if (!userAddress || !market) {
       alert('Cannot repay: User or market details missing.');
       return;
@@ -77,10 +77,10 @@ class ActiveLoansList extends Component {
     // For "Repay Full", amountToRepay is loan.get('borrowedAmount')
     // The action expects a string. BigNumber(string).toString() is fine.
     dispatch(initiateRepayLoan(
-      marketID, 
-      userAddress, 
-      loan.get('assetAddress'), 
-      loan.get('symbol'), 
+      marketID,
+      userAddress,
+      loan.get('assetAddress'),
+      loan.get('symbol'),
       loan.get('amountBorrowed').toString()
     ));
   };
@@ -123,7 +123,7 @@ class ActiveLoansList extends Component {
               const market = getMarketDetails(marketsData, loanMarketID);
               const marketSymbol = market ? market.get('symbol', 'N/A') : loanMarketID;
               const assetSymbol = loan.get('symbol', loan.get('assetAddress'));
-              
+
               // Find decimals for the specific asset - can be complex if asset is not base/quote of its loan marketID
               // For simplicity, assume assetSymbol matches either base or quote of *its* market for decimals.
               let assetDecimals = 8; // Default

@@ -2,13 +2,17 @@ import React, { Component } from 'react';
 import { connect } from 'react-redux';
 import { BigNumber } from 'bignumber.js';
 import { Map, List } from 'immutable'; // Import Map for marketsData default
-import { 
-  fetchOpenPositions, 
-  initiateCloseMarginPosition 
+import { Map } from 'immutable'; // Import Map for marketsData default
+import { withRouter } from 'react-router-dom';
+import {
+  fetchOpenPositions,
+  // initiateCloseMarginPosition // No longer directly called from here
 } from '../../actions/marginActions';
-import { 
-  getOpenPositionsList, 
-  getOpenPositionsLoading, 
+import { prefillTradeFormForClose } from '../../actions/uiActions';
+import { setCurrentMarket } from '../../actions/market'; // Assuming this action exists
+import {
+  getOpenPositionsList,
+  getOpenPositionsLoading,
   getOpenPositionsError,
   getAuctionsByMarketIdAuctionIdMap // Import auction selector
 } from '../../selectors/marginSelectors';
@@ -34,32 +38,35 @@ class OpenPositionsList extends Component {
   }
 
   handleClosePosition = (position) => {
-    const { userAddress, dispatch, marketsData } = this.props;
-    // Ensure marketID is a string if your marketsData map uses string keys,
-    // or adapt as necessary based on how marketID is stored in position data.
-    const marketID = position.get('marketID').toString(); 
-    const market = getMarketDetails(marketsData, marketID);
+    const { dispatch, marketsData } = this.props;
+    const positionMarketID = position.get('marketID'); // This should be the string ID like "ETH-DAI"
+    const market = getMarketDetails(marketsData, positionMarketID);
 
-    if (!userAddress) {
-      alert('User address not found. Please connect your wallet.');
-      return;
-    }
     if (!market) {
-      console.error(`Market details not found for marketID: ${marketID}`, position.toJS());
-      alert(`Market details not found for marketID: ${marketID}`);
+      console.error(`Market details not found for marketID: ${positionMarketID}`, position.toJS());
+      alert(`Market details for ${positionMarketID} not found. Cannot prefill trade form.`);
       return;
     }
 
-    const baseAssetSymbol = market.get('baseToken');
-    const quoteAssetSymbol = market.get('quoteToken');
-    
-    // The action initiateCloseMarginPosition expects the marketID that the backend uses.
-    // If the backend uses the string symbol (e.g., "HOT-ETH"), then market.get('id') is correct.
-    // If it uses a numerical ID from the DB, ensure position.get('marketID') provides that.
-    // For now, assuming position.get('marketID') is the correct identifier.
-    dispatch(initiateCloseMarginPosition(position.get('marketID'), userAddress, baseAssetSymbol, quoteAssetSymbol));
+    const positionDetails = {
+      marketID: market.get('id'), // Use the string ID like "ETH-DAI"
+      originalSide: position.get('side'), // "Long" or "Short"
+      sizeToClose: position.get('size'),
+      baseAssetSymbol: market.get('baseToken'), // Ensure these are correct from market object
+      quoteAssetSymbol: market.get('quoteToken'),
+      // Optional: Suggest a price (e.g., current mark_price or best bid/ask)
+      // For now, we'll let Trade.js decide price or leave it blank for limit orders.
+      // closePriceSuggestion: position.get('markPrice')
+    };
+
+    dispatch(prefillTradeFormForClose(positionDetails));
+    dispatch(setCurrentMarket(market.get('id'))); // Ensure current market is switched
+    this.props.history.push('/'); // Navigate to the main page where Trade component is assumed to be
   };
 
+  // VERIFY_WS_UPDATE: When MARGIN_ACCOUNT_UPDATE or AUCTION_UPDATE messages update Redux state
+  // for `positionsList` or `activeAuctionsByMarketId`, this component should re-render.
+  // Test that margin ratios, P&L (if calculated here), and auction indicators update dynamically.
   render() {
     const { isLoading, error, positionsList, marketsData, userAddress, activeAuctionsByMarketId } = this.props;
 
@@ -73,6 +80,10 @@ class OpenPositionsList extends Component {
 
     if (!positionsList || positionsList.isEmpty()) {
       return <div style={{ padding: '20px', textAlign: 'center' }}>You have no open margin positions.</div>;
+    }
+
+    if (positionsList && !positionsList.isEmpty()) {
+      console.log("OpenPositionsList rendering with positions:", positionsList.toJS());
     }
 
     return (
@@ -94,9 +105,9 @@ class OpenPositionsList extends Component {
           </thead>
           <tbody>
             {positionsList.map((position, index) => {
-              const positionMarketID = position.get('marketID'); 
+              const positionMarketID = position.get('marketID');
               const market = getMarketDetails(marketsData, positionMarketID);
-              
+
               const marketSymbol = market ? market.get('id') : position.get('marketSymbol', 'N/A'); // Use market 'id' (e.g. "HOT-ETH")
               const baseSymbol = market ? market.get('baseToken') : position.get('baseAssetSymbol', '');
               const quoteSymbol = market ? market.get('quoteToken') : position.get('quoteAssetSymbol', '');
@@ -108,9 +119,9 @@ class OpenPositionsList extends Component {
               const entryPrice = new BigNumber(position.get('entryPrice', '0'));
               const markPrice = new BigNumber(position.get('markPrice', '0'));
               let unrealizedPnL = new BigNumber(position.get('unrealizedPnL', '0'));
-              const marginRatio = new BigNumber(position.get('marginRatio', '0')); 
+              const marginRatio = new BigNumber(position.get('marginRatio', '0'));
               const liquidationPrice = new BigNumber(position.get('liquidationPrice', '0'));
-              
+
               const pnlColor = unrealizedPnL.isPositive() ? 'green' : unrealizedPnL.isNegative() ? 'red' : '#333';
               const sideColor = side.toLowerCase() === 'long' ? 'green' : side.toLowerCase() === 'short' ? 'red' : '#333';
 
@@ -118,7 +129,7 @@ class OpenPositionsList extends Component {
               if (activeAuctionsByMarketId && userAddress) {
                 const marketAuctions = activeAuctionsByMarketId.get(positionMarketID.toString());
                 if (marketAuctions) {
-                  const userAuction = marketAuctions.find(auc => 
+                  const userAuction = marketAuctions.find(auc =>
                     auc.get('borrower') === userAddress && !auc.get('finished')
                   );
                   if (userAuction) {
@@ -126,7 +137,7 @@ class OpenPositionsList extends Component {
                   }
                 }
               }
-              
+
               return (
                 <tr key={position.get('id') || index} style={tableRowStyle}>
                   <td style={tableCellStyle}>{marketSymbol} {auctionIndicator}</td>
@@ -168,4 +179,4 @@ const mapStateToProps = (state) => {
   };
 };
 
-export default connect(mapStateToProps)(OpenPositionsList);
+export default withRouter(connect(mapStateToProps)(OpenPositionsList));

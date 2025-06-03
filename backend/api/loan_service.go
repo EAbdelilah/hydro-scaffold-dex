@@ -11,6 +11,7 @@ import (
 	"github.com/HydroProtocol/hydro-sdk-backend/utils" // For DecimalToBigInt, Dump
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/labstack/echo"
 	"github.com/shopspring/decimal"
 	"strings"
 	// "github.com/HydroProtocol/hydro-sdk-go/sdk" // Placeholder for actual SDK package
@@ -34,7 +35,7 @@ func BorrowLoan(p Param) (interface{}, error) {
 		return nil, NewApiError(http.StatusBadRequest, "Amount to borrow must be positive")
 	}
 
-	market := models.MarketDao.FindMarketByID(req.MarketID)
+	market := models.MarketDaoSql.FindMarketByID(req.MarketID) // Assuming MarketDaoSql is the global DAO
 	if market == nil {
 		return nil, NewApiError(http.StatusNotFound, fmt.Sprintf("Market %s not found", req.MarketID))
 	}
@@ -53,45 +54,41 @@ func BorrowLoan(p Param) (interface{}, error) {
 		tokenDecimals = market.QuoteTokenDecimals
 	}
 
-	// --- Pre-Borrow Collateral Check (Placeholder) ---
 	commonAssetAddress := common.HexToAddress(req.AssetAddress)
-	uint16MarketID, err := sw.MarketIDToUint16(req.MarketID)
+	uint16MarketID, err := sw.MarketIDToUint16(req.MarketID) // Ensure MarketIDToUint16 is robust or market.ID_uint16() is used
 	if err != nil {
 		return nil, NewApiError(http.StatusBadRequest, fmt.Sprintf("Invalid MarketID format for SDK: %v", err))
 	}
+	hydroSDK := GetHydroSDK() // Ensure GetHydroSDK is available
 
 	// --- Pre-Borrow Collateral Check ---
-	currentAccountDetails, err := sw.GetAccountDetails(hydro, commonUserAddress, uint16MarketID)
+	currentAccountDetails, err := sw.GetAccountDetails(hydroSDK, commonUserAddress, uint16MarketID)
 	if err != nil {
 		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to get current account details for pre-borrow check: %v", err))
 	}
-	currentAssetsUSD := utils.WeiToDecimalAmount(currentAccountDetails.AssetsTotalUSDValue, 18)
-	currentDebtsUSD := utils.WeiToDecimalAmount(currentAccountDetails.DebtsTotalUSDValue, 18)
+	currentAssetsUSD := utils.BigIntToDecimal(currentAccountDetails.AssetsTotalUSDValue, 18) // Assuming 18d for USD values
+	currentDebtsUSD := utils.BigIntToDecimal(currentAccountDetails.DebtsTotalUSDValue, 18)  // Assuming 18d for USD values
 
-	// Conceptual: Get price of the asset to be borrowed in USD. This requires an oracle or price feed.
-	// For placeholder, assume 1 token = 1 USD for simplicity.
-	priceOfBorrowedAssetUSD := decimal.NewFromInt(1) // Placeholder
-	newLoanUSDValue := req.Amount.Mul(priceOfBorrowedAssetUSD)
+	// Get price of the asset to be borrowed in USD
+	assetToBorrowPriceUSD, errPrice := getPriceUSD(hydroSDK, commonAssetAddress, market.GetTokenSymbolByAddress(req.AssetAddress))
+	if errPrice != nil {
+		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to get price for asset %s: %v", req.AssetAddress, errPrice))
+	}
+	if assetToBorrowPriceUSD.IsZero() {
+		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Oracle price for asset %s is zero. Cannot perform USD calculations for borrow check.", req.AssetAddress))
+	}
+
+	newLoanUSDValue := req.Amount.Mul(assetToBorrowPriceUSD)
 	projectedTotalDebtsUSD := currentDebtsUSD.Add(newLoanUSDValue)
 
 	utils.Dump("Pre-Borrow Check: CurrentAssetsUSD:", currentAssetsUSD.String(), "CurrentDebtsUSD:", currentDebtsUSD.String(), "NewLoanUSD:", newLoanUSDValue.String(), "ProjectedTotalDebtsUSD:", projectedTotalDebtsUSD.String(), "Market LiquidateRate:", market.LiquidateRate.String())
 
-	if projectedTotalDebtsUSD.IsPositive() && currentAssetsUSD.LessThan(projectedTotalDebtsUSD.Mul(market.LiquidateRate)) {
-		// CRITICAL: market.LiquidateRate should be > 1 for this math (e.g. 1.5 for 150% collateralization)
-		// Or, if LiquidateRate is < 1 (e.g. 0.75 for 75% LTV), then check: currentAssetsUSD * market.LiquidateRate < projectedTotalDebtsUSD
-		// Assuming LiquidateRate is like a collateral ratio (e.g., 1.1 means assets must be 110% of debts)
-		// So, if Assets < Debts * 1.1, it's not allowed.
-		return nil, NewApiError(http.StatusBadRequest, fmt.Sprintf("Borrowing this amount would bring collateral ratio below liquidation threshold. Assets: %s, Projected Debts: %s, Required Ratio: %s", currentAssetsUSD.String(), projectedTotalDebtsUSD.String(), market.LiquidateRate.String()))
+	if projectedTotalDebtsUSD.IsPositive() && market.LiquidateRate.IsPositive() && currentAssetsUSD.Div(projectedTotalDebtsUSD).LessThan(market.LiquidateRate) {
+		return nil, NewApiError(http.StatusBadRequest, fmt.Sprintf("Borrowing this amount would bring collateral ratio below liquidation threshold. AssetsUSD: %s, ProjectedDebtsUSD: %s, Required Ratio: %s", currentAssetsUSD.StringFixed(2), projectedTotalDebtsUSD.StringFixed(2), market.LiquidateRate.StringFixed(2)))
 	}
-	// Placeholder for GetInterestRates - not directly used in pre-borrow check logic here yet, but might be for other validations.
-	_, err = sw.GetInterestRates(hydro, commonAssetAddress, utils.DecimalToWei(req.Amount, tokenDecimals))
-	if err != nil {
-		utils.Warning("Failed to get interest rates during pre-borrow check (non-critical for this check): %v", err)
-	}
-	utils.Dump("Pre-borrow collateral check passed.")
 
 	// --- Construct Batch Action ---
-	amountBigInt := utils.DecimalToWei(req.Amount, tokenDecimals)
+	amountBigInt := utils.DecimalToBigInt(req.Amount, int32(tokenDecimals))
 	encodedParams, err := sw.EncodeBorrowParamsForBatch(uint16MarketID, commonAssetAddress, amountBigInt)
 	if err != nil {
 		return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to encode borrow params: %v", err))
@@ -101,128 +98,162 @@ func BorrowLoan(p Param) (interface{}, error) {
 		ActionType:    sw.SDKActionTypeBorrow,
 		EncodedParams: encodedParams,
 	}
+    txValue := big.NewInt(0)
+	unsignedTxForClient, err := sw.PrepareBatchActionsTransaction(hydroSDK, []sw.SDKBatchAction{action}, commonUserAddress, txValue)
+    if err != nil {
+        utils.Errorf("BorrowLoan: Failed to prepare batch actions transaction data: %v", err)
+        return nil, NewApiError(http.StatusInternalServerError, fmt.Sprintf("Failed to prepare transaction data: %v", err))
+    }
 
-	// --- Prepare Unsigned Transaction ---
-	if sw.MarginContractAddress == (common.Address{}) {
-		return nil, NewError(http.StatusInternalServerError, "Margin contract address not initialized")
-	}
-	marginContractABIForPack, err := abi.JSON(strings.NewReader(sw.MarginContractABIJsonString))
-	if err != nil {
-		return nil, NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
-	}
-	packedBatchData, err := marginContractABIForPack.Pack("batch", []sw.SDKBatchAction{action})
-	if err != nil {
-		return nil, NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for borrow: %v", err))
-	}
-
-	unsignedTxForClient := &common.UnsignedTxDataForClient{
-		From:     commonUserAddress.Hex(),
-		To:       sw.MarginContractAddress.Hex(),
-		Value:    "0", // Assuming no ETH value sent directly to batch function
-		Data:     common.Bytes2Hex(packedBatchData),
-		GasPrice: "0", // Placeholder - should be estimated or from config
-		GasLimit: "0", // Placeholder - should be estimated
-	}
 	utils.Info("Prepared unsigned transaction for borrow loan.")
 	return unsignedTxForClient, nil
 }
 
-// GetLoans lists the current loans for a user in a specific margin market.
-func GetLoans(p Param) (interface{}, error) {
-	req := p.(*LoanListReq)
 
-	// TODO: Replace with userAddress from authenticated context c.Get("userID").(string)
-	// once LoanListReq stops taking UserAddress as a query parameter and relies on auth.
-	reqUserAddress := req.GetAddress() // Uses LoanListReq.GetAddress()
-	if reqUserAddress == "" {
-		// This case should ideally be prevented by validation on LoanListReq.UserAddress or caught by auth middleware.
-		return nil, NewApiError(http.StatusBadRequest, "User address is required")
+type GetLoansReq struct {
+	MarketID             string `json:"marketID" query:"marketID"` // Optional
+	IncludeInterestRates bool   `json:"includeInterestRates" query:"includeInterestRates"`
+}
+
+// LoanDetail defines the structure for a single loan entry.
+type LoanDetail struct {
+	MarketID        uint16 `json:"marketID"`
+	MarketSymbol    string `json:"marketSymbol"`
+	AssetAddress    string `json:"assetAddress"`
+	AssetSymbol     string `json:"assetSymbol"`
+	BorrowedAmount  string `json:"borrowedAmount"`  // Native asset decimals
+	InterestRateAPY string `json:"interestRateAPY"` // Placeholder or raw rate
+	AccruedInterest string `json:"accruedInterest"` // Placeholder: "N/A"
+}
+
+// GetLoans retrieves a list of active loans for the authenticated user.
+func (h *HydroApi) GetLoans(c echo.Context) error {
+	req := new(GetLoansReq)
+	if err := c.Bind(req); err != nil {
+		return NewError(http.StatusBadRequest, err.Error())
 	}
-	commonUserAddress := common.HexToAddress(reqUserAddress)
+	// No specific validation for GetLoansReq yet, beyond what Bind does.
 
-	market := models.MarketDao.FindMarketByID(req.MarketID)
-	if market == nil {
-		return nil, NewApiError(http.StatusNotFound, fmt.Sprintf("Market %s not found", req.MarketID))
+	customCtx := c.(*CustomContext)
+	userAddressHex := customCtx.Get("userAddress").(string)
+	if userAddressHex == "" {
+		return NewError(http.StatusUnauthorized, "User address not available. Authentication required.")
 	}
-	if !market.BorrowEnable { // Only margin-enabled markets can have loans
-		// Return empty list for non-margin markets, or an error, depending on desired behavior.
-		// For now, let's assume if not borrow enabled, no loans are possible.
-		return LoanListResp{MarketID: req.MarketID, UserAddress: userAddress, Loans: []LoanDetails{}}, nil
-	}
+	userAddressCommon := common.HexToAddress(userAddressHex)
 
-	loans := []LoanDetails{}
-
-	// --- Fetch Base Token Borrowed Amount (SDK Call Placeholder) ---
-	uint16MarketID, err := sw.MarketIDToUint16(req.MarketID)
-	if err != nil {
-		return nil, NewApiError(http.StatusBadRequest, fmt.Sprintf("Invalid MarketID format for SDK: %v", err))
+	hydroSDK := GetHydroSDK()
+	if hydroSDK == nil {
+		return NewError(http.StatusInternalServerError, "Hydro SDK not available")
 	}
 
-	loans := []LoanDetails{}
-	commonBaseTokenAddress := common.HexToAddress(market.BaseTokenAddress)
-	commonQuoteTokenAddress := common.HexToAddress(market.QuoteTokenAddress)
-
-	// --- Fetch Base Token Borrowed Amount ---
-	baseBorrowedBigInt, err := sw.GetAmountBorrowed(hydro, commonUserAddress, uint16MarketID, commonBaseTokenAddress)
-	if err != nil {
-		utils.Errorf("Failed to get base token borrowed amount for user %s, market %s: %v", reqUserAddress, req.MarketID, err)
-		// Decide if this is a fatal error or if we can continue to fetch quote token loan
-		// return nil, NewApiError(http.StatusInternalServerError, "Failed to fetch base token loan details")
+	var marketsToCheck []*models.Market
+	if req.MarketID != "" {
+		marketID_uint16, errConv := sw.MarketIDToUint16(req.MarketID) // Use sdk_wrappers helper
+		if errConv != nil {
+			return NewError(http.StatusBadRequest, "Invalid Market ID format")
+		}
+		market, errDb := models.MarketDaoSql.FindMarketByMarketID(marketID_uint16)
+		if errDb != nil {
+			return NewError(http.StatusNotFound, fmt.Sprintf("Market %s not found", req.MarketID))
+		}
+		if market != nil && market.BorrowEnable {
+			marketsToCheck = append(marketsToCheck, market)
+		}
 	} else {
-		if baseBorrowedBigInt.Cmp(big.NewInt(0)) > 0 {
-			baseBorrowedDecimal := utils.WeiToDecimalAmount(baseBorrowedBigInt, market.BaseTokenDecimals)
-			baseBorrowedDecimal := utils.WeiToDecimalAmount(baseBorrowedBigInt, market.BaseTokenDecimals)
-			loanDetail := LoanDetails{
-				AssetAddress:   market.BaseTokenAddress,
-				Symbol:         market.BaseTokenSymbol,
-				AmountBorrowed: baseBorrowedDecimal,
-			}
+		allMarkets, errDb := models.MarketDaoSql.GetAllMarkets(true) // true for borrow_enable = true
+		if errDb != nil {
+			utils.Errorf("GetLoans: Failed to fetch all borrow-enabled markets: %v", errDb)
+			return NewError(http.StatusInternalServerError, "Failed to fetch markets")
+		}
+		marketsToCheck = allMarkets
+	}
 
-			// Optionally, fetch and add interest rates
-			// Note: GetInterestRates might take an `extraBorrowAmount` which is 0 for current rates.
-			// The actual calculation of accrued interest might be complex and depend on time, etc.
-			// For now, just fetching the rate.
-			interestRates, errRates := sw.GetInterestRates(hydro, commonBaseTokenAddress, big.NewInt(0))
-			if errRates != nil {
-				utils.Warningf("Failed to get interest rates for base asset %s in market %s: %v", market.BaseTokenSymbol, req.MarketID, errRates)
-				// Do not fail the whole request, just omit interest rate if not available
-			} else if interestRates != nil {
-				// Assuming BorrowInterestRate is an annual rate, needs conversion based on contract's representation (e.g., per block, per second)
-				// This is a placeholder for actual accrued interest calculation.
-				// For now, storing the raw rate as a decimal (assuming 18 decimals for the rate itself).
-				loanDetail.CurrentInterestRate = utils.WeiToDecimalAmount(interestRates.BorrowInterestRate, 18) // Placeholder: use actual rate decimals
-				utils.Infof("Interest rate for base asset %s: %s", market.BaseTokenSymbol, loanDetail.CurrentInterestRate.String())
+	if len(marketsToCheck) == 0 {
+		return c.JSON(http.StatusOK, &common.Response{Status: 0, Data: []LoanDetail{}})
+	}
+
+	var results []LoanDetail
+
+	for _, market := range marketsToCheck {
+		marketID_uint16 := market.ID_uint16()
+		baseAssetAddr := common.HexToAddress(market.BaseTokenAddress)
+		quoteAssetAddr := common.HexToAddress(market.QuoteTokenAddress)
+
+		// Check base asset borrow
+		baseBorrowedBigInt, errBase := sw.GetAmountBorrowed(hydroSDK, baseAssetAddr, userAddressCommon, marketID_uint16)
+		if errBase != nil {
+			utils.Warningf("GetLoans: Failed to get base borrowed amount for market %s, user %s: %v. Assuming 0.", market.ID, userAddressHex, errBase)
+			baseBorrowedBigInt = big.NewInt(0)
+		}
+		if baseBorrowedBigInt.Sign() > 0 {
+			loanDetail := LoanDetail{
+				MarketID:        marketID_uint16,
+				MarketSymbol:    market.ID,
+				AssetAddress:    market.BaseTokenAddress,
+				AssetSymbol:     market.BaseTokenSymbol,
+				BorrowedAmount:  utils.BigWeiToDecimal(baseBorrowedBigInt, int32(market.BaseTokenDecimals)).StringFixed(market.AmountPrecision),
+				AccruedInterest: "N/A", // Placeholder
 			}
-			loans = append(loans, loanDetail)
+			if req.IncludeInterestRates {
+				rates, rateErr := sw.GetInterestRates(hydroSDK, baseAssetAddr, big.NewInt(0)) // extraBorrowAmount = 0 for current rate
+				if rateErr == nil && rates != nil && rates.BorrowInterestRate != nil {
+					// Placeholder APY calculation - assumes rate is per second and 1e18 scaled.
+					// Real APY = (1 + rate_per_period)^periods_per_year - 1
+					// If rates.BorrowInterestRate is per second (e.g., 1e18 * 0.00000000X)
+					ratePerSecond := decimal.NewFromBigInt(rates.BorrowInterestRate, -18)
+					secondsPerYear := decimal.NewFromInt(365 * 24 * 60 * 60)
+					// Simple interest for APY: rate_per_second * seconds_in_year * 100
+					apyFromRaw := ratePerSecond.Mul(secondsPerYear).Mul(decimal.NewFromInt(100))
+					loanDetail.InterestRateAPY = apyFromRaw.StringFixed(2) + "%"
+					// TODO: Verify actual contract rate period (per second vs per block) and scaling for accurate APY.
+				} else {
+					loanDetail.InterestRateAPY = "Error fetching rate"
+					utils.Warningf("GetLoans: Failed to get interest rates for base asset %s in market %s: %v", market.BaseTokenSymbol, market.ID, rateErr)
+				}
+			} else {
+				loanDetail.InterestRateAPY = "N/A (not requested)"
+			}
+			results = append(results, loanDetail)
+		}
+
+		// Check quote asset borrow
+		quoteBorrowedBigInt, errQuote := sw.GetAmountBorrowed(hydroSDK, quoteAssetAddr, userAddressCommon, marketID_uint16)
+		if errQuote != nil {
+			utils.Warningf("GetLoans: Failed to get quote borrowed amount for market %s, user %s: %v. Assuming 0.", market.ID, userAddressHex, errQuote)
+			quoteBorrowedBigInt = big.NewInt(0)
+		}
+		if quoteBorrowedBigInt.Sign() > 0 {
+			loanDetail := LoanDetail{
+				MarketID:        marketID_uint16,
+				MarketSymbol:    market.ID,
+				AssetAddress:    market.QuoteTokenAddress,
+				AssetSymbol:     market.QuoteTokenSymbol,
+				BorrowedAmount:  utils.BigWeiToDecimal(quoteBorrowedBigInt, int32(market.QuoteTokenDecimals)).StringFixed(market.PricePrecision), // Using PricePrecision for quote asset amount
+				AccruedInterest: "N/A", // Placeholder
+			}
+			if req.IncludeInterestRates {
+				rates, rateErr := sw.GetInterestRates(hydroSDK, quoteAssetAddr, big.NewInt(0))
+				if rateErr == nil && rates != nil && rates.BorrowInterestRate != nil {
+					ratePerSecond := decimal.NewFromBigInt(rates.BorrowInterestRate, -18)
+					secondsPerYear := decimal.NewFromInt(365 * 24 * 60 * 60)
+					apyFromRaw := ratePerSecond.Mul(secondsPerYear).Mul(decimal.NewFromInt(100))
+					loanDetail.InterestRateAPY = apyFromRaw.StringFixed(2) + "%"
+					// TODO: Verify actual contract rate period and scaling for accurate APY.
+				} else {
+					loanDetail.InterestRateAPY = "Error fetching rate"
+					utils.Warningf("GetLoans: Failed to get interest rates for quote asset %s in market %s: %v", market.QuoteTokenSymbol, market.ID, rateErr)
+				}
+			} else {
+				loanDetail.InterestRateAPY = "N/A (not requested)"
+			}
+			results = append(results, loanDetail)
 		}
 	}
 
-	// --- Fetch Quote Token Borrowed Amount ---
-	quoteBorrowedBigInt, err := sw.GetAmountBorrowed(hydro, commonUserAddress, uint16MarketID, commonQuoteTokenAddress)
-	if err != nil {
-		utils.Errorf("Failed to get quote token borrowed amount for user %s, market %s: %v", reqUserAddress, req.MarketID, err)
-		// return nil, NewApiError(http.StatusInternalServerError, "Failed to fetch quote token loan details")
-	} else {
-		if quoteBorrowedBigInt.Cmp(big.NewInt(0)) > 0 {
-			quoteBorrowedDecimal := utils.WeiToDecimalAmount(quoteBorrowedBigInt, market.QuoteTokenDecimals)
-			loanDetail := LoanDetails{
-				AssetAddress:   market.QuoteTokenAddress,
-				Symbol:         market.QuoteTokenSymbol,
-				AmountBorrowed: quoteBorrowedDecimal,
-			}
-
-			interestRates, errRates := sw.GetInterestRates(hydro, commonQuoteTokenAddress, big.NewInt(0))
-			if errRates != nil {
-				utils.Warningf("Failed to get interest rates for quote asset %s in market %s: %v", market.QuoteTokenSymbol, req.MarketID, errRates)
-			} else if interestRates != nil {
-				loanDetail.CurrentInterestRate = utils.WeiToDecimalAmount(interestRates.BorrowInterestRate, 18) // Placeholder
-				utils.Infof("Interest rate for quote asset %s: %s", market.QuoteTokenSymbol, loanDetail.CurrentInterestRate.String())
-			}
-			loans = append(loans, loanDetail)
-		}
-	}
-
-	return LoanListResp{MarketID: req.MarketID, UserAddress: reqUserAddress, Loans: loans}, nil
+	return c.JSON(http.StatusOK, &common.Response{
+		Status: 0,
+		Data:   results,
+	})
 }
 
 // RepayLoan handles the request to repay a borrowed asset in a margin market.

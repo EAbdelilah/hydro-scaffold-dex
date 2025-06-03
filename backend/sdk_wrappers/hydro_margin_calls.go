@@ -667,7 +667,7 @@ func GetOraclePrice(hydro sdk.Hydro, oracleAddress goEthereumCommon.Address, ass
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack arguments for %s (Oracle: %s, Asset: %s): %v", methodName, oracleAddress.Hex(), assetAddress.Hex(), err)
 	}
-	
+
 	// Construct call data: methodID + packedArgs
 	// Method ID is the first 4 bytes of the Keccak256 hash of the function signature.
 	// The abi.Method object contains this ID.
@@ -935,7 +935,7 @@ func GenerateMarginOrderDataHex(
 	// makerRebateRate (2 bytes, uint16, rate * 100000) [12:13]
 	makerRebateRateInt := makerRebateRate.Mul(decimal.NewFromInt(100000)).IntPart()
 	binary.BigEndian.PutUint16(orderDataBytes[12:14], uint16(makerRebateRateInt))
-	
+
 	// salt (8 bytes, uint64) [14:21]
 	binary.BigEndian.PutUint64(orderDataBytes[14:22], uint64(salt))
 
@@ -1087,33 +1087,64 @@ func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginP
 
 	// 4. Fallback to Database if IMR or MMR not fetched from chain
 	dbSourcedIMR := false
+	dbSourcedIMR := false
 	dbSourcedMMR := false
+	var marketDBRecord *models.Market // Declare here to use across IMR and MMR DB checks
+	var dbErr error                     // Declare here for the same reason
 
 	if !imrFetchedFromChain || !mmrFetchedFromChain {
-		utils.Warningf("GetMarketMarginParameters for marketID %d: IMR and/or MMR not directly available from contract. Attempting to fetch from database.", marketID)
-		// Assuming models.MarketDaoSql is the accessible DAO instance.
-		// This might need to be models.MarketDao depending on how it's initialized in your project.
-		marketDBRecord, dbErr := models.MarketDaoSql.FindMarketByMarketID(marketID)
-		if dbErr == nil && marketDBRecord != nil {
-			if !imrFetchedFromChain && marketDBRecord.InitialMarginFraction.IsPositive() {
-				params.InitialMarginFraction = marketDBRecord.InitialMarginFraction
-				imrFetchedFromChain = true // Effectively, as it's now sourced
-				dbSourcedIMR = true
-				utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction fetched from database: %s", marketID, params.InitialMarginFraction.String())
-			}
-			if !mmrFetchedFromChain && marketDBRecord.MaintenanceMarginFraction.IsPositive() {
-				params.MaintenanceMarginFraction = marketDBRecord.MaintenanceMarginFraction
-				mmrFetchedFromChain = true // Effectively, as it's now sourced
-				dbSourcedMMR = true
-				utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction fetched from database: %s", marketID, params.MaintenanceMarginFraction.String())
-			}
-		} else {
+		utils.Infof("GetMarketMarginParameters for marketID %d: IMR and/or MMR not (fully) sourced from chain. Attempting DB fallback.", marketID)
+		marketDBRecord, dbErr = models.MarketDaoSql.FindMarketByMarketID(marketID)
+		if dbErr != nil || marketDBRecord == nil {
 			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to fetch market details from database or market not found: %v", marketID, dbErr)
 		}
 	}
 
-	// 5. Final Fallback/Derivation logic if IMR or MMR still not populated
-	if !mmrFetchedFromChain { // Not from chain and not from DB (or DB value was invalid)
+	// Attempt to use DB value for IMR if not from chain
+	if !imrFetchedFromChain && marketDBRecord != nil {
+		imrFromDB := marketDBRecord.InitialMarginFraction
+		if imrFromDB.IsPositive() && imrFromDB.LessThan(decimal.NewFromInt(1)) { // Validate: 0 < IMR < 1
+			params.InitialMarginFraction = imrFromDB
+			imrFetchedFromChain = true // Mark as sourced to prevent derivation later
+			dbSourcedIMR = true
+			utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction sourced from database: %s", marketID, params.InitialMarginFraction.String())
+		} else {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Invalid IMR value found in DB (%s). Will attempt derivation if needed.", marketID, imrFromDB.String())
+		}
+	}
+
+	// Attempt to use DB value for MMR if not from chain
+	if !mmrFetchedFromChain && marketDBRecord != nil {
+		mmrFromDB := marketDBRecord.MaintenanceMarginFraction
+		if mmrFromDB.IsPositive() && mmrFromDB.LessThan(decimal.NewFromInt(1)) { // Validate: 0 < MMR < 1
+			// Additional check: if IMR was sourced (either chain or DB), ensure MMR < IMR
+			if imrFetchedFromChain && params.InitialMarginFraction.LessThanOrEqual(mmrFromDB) {
+				utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from DB (%s) is not less than IMR (%s). Invalidating DB MMR.", marketID, mmrFromDB.String(), params.InitialMarginFraction.String())
+			} else {
+				params.MaintenanceMarginFraction = mmrFromDB
+				mmrFetchedFromChain = true // Mark as sourced
+				dbSourcedMMR = true
+				utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction sourced from database: %s", marketID, params.MaintenanceMarginFraction.String())
+			}
+		} else {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Invalid MMR value found in DB (%s). Will attempt derivation if needed.", marketID, mmrFromDB.String())
+		}
+	}
+
+	// If both IMR and MMR were sourced (either chain or DB), but are inconsistent, invalidate derived ones to trigger re-derivation.
+	if imrFetchedFromChain && mmrFetchedFromChain && params.InitialMarginFraction.LessThanOrEqual(params.MaintenanceMarginFraction) {
+		utils.Warningf("GetMarketMarginParameters for marketID %d: Sourced IMR (%s) is not greater than sourced MMR (%s). Invalidating both and falling back to derivation for consistency.", marketID, params.InitialMarginFraction.String(), params.MaintenanceMarginFraction.String())
+		imrFetchedFromChain = false // Force re-derivation or re-sourcing if one was from DB and other from chain
+		mmrFetchedFromChain = false
+		dbSourcedIMR = false // Reset DB flags too
+		dbSourcedMMR = false
+		params.InitialMarginFraction = decimal.Zero // Reset to ensure derivation logic runs correctly
+		params.MaintenanceMarginFraction = decimal.Zero
+	}
+
+
+	// 5. Final Fallback/Derivation logic if IMR or MMR still not populated robustly
+	if !mmrFetchedFromChain { // Not from chain and not from valid DB
 		utils.Warningf("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction is DERIVED from LiquidateRate as a final fallback. VERIFY THIS LOGIC.", marketID)
 		if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
 			params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
@@ -1128,7 +1159,7 @@ func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginP
 	if !imrFetchedFromChain { // Not from chain and not from DB (or DB value was invalid)
 		utils.Warningf("GetMarketMarginParameters for marketID %d: InitialMarginFraction is DERIVED from MaintenanceMarginFraction as a final fallback. VERIFY THIS LOGIC.", marketID)
 		// Ensure MaintenanceMarginFraction is populated (either from chain, DB, or derivation) before deriving IMR
-		if params.MaintenanceMarginFraction.IsZero() && !mmrFetchedFromChain { 
+		if params.MaintenanceMarginFraction.IsZero() && !mmrFetchedFromChain {
 			// This case implies MMR derivation from LiquidateRate also resulted in zero or was skipped.
 			// We need a valid MMR to derive IMR. If LiquidateRate was <=1, MMR defaults to 0.05.
 			// If LiquidateRate itself was 0, then MMR would be -1 from derivation logic above, then overridden by 0.05.
@@ -1136,13 +1167,13 @@ func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginP
 			if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
 				params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
 			} else {
-				params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05) 
+				params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05)
 			}
 		}
 		params.InitialMarginFraction = params.MaintenanceMarginFraction.Add(decimal.NewFromFloat(0.10))
 		// TODO: IMR is derived from placeholder MMR + 10% (absolute percentage points). Verify this placeholder logic against actual system requirements.
 	}
-	
+
 	sourceSummary := fmt.Sprintf("IMR Source: %s, MMR Source: %s",
 		getParamSource(imrFetchedFromChain, dbSourcedIMR),
 		getParamSource(mmrFetchedFromChain, dbSourcedMMR))
@@ -1251,34 +1282,61 @@ func GetTokenDecimals(hydro sdk.Hydro, tokenAddress goEthereumCommon.Address) (i
 // }
 
 // PrepareLiquidateAccountDirectTransaction prepares the data for a direct call to liquidateAccount on the Margin Contract.
-// func PrepareLiquidateAccountDirectTransaction(hydro sdk.Hydro, liquidatorAddress goEthereumCommon.Address, userToLiquidate goEthereumCommon.Address, marketID uint16) (*UnsignedTxDataForClient, error) {
-// 	// if marginContractABI.Methods == nil { 
-// 	// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: Margin ABI not initialized") 
-// 	// }
-// 	// method, ok := marginContractABI.Methods["liquidateAccount"] // Assuming "liquidateAccount" is the direct method name
-// 	// if !ok { 
-// 	// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: liquidateAccount method not found in Margin ABI") 
-// 	// }
-// 	//
-// 	// packedArgs, err := method.Inputs.Pack(userToLiquidate, marketID)
-// 	// if err != nil { 
-// 	// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to pack args for liquidateAccount: %w", err) 
-// 	// }
-// 	// fullTxData := append(method.ID, packedArgs...)
-// 	//
-// 	// // TODO: Fetch nonce, gasPrice, gasLimit, chainID for liquidatorAddress
-// 	// // This would be similar to the logic in PrepareBatchActionsTransaction:
-// 	// // hydroEth, okEth := hydro.(*ethereum.EthereumHydro); // ... get ethCl
-// 	// // nonce, err := ethCl.PendingNonceAt(...)
-// 	// // gasPrice, err := ethCl.SuggestGasPrice(...)
-// 	// // callMsg := hydroSDKCommon.GethCallMsg{ From: liquidatorAddress, To: &MarginContractAddress, Data: fullTxData }
-// 	// // gasLimit, err := ethCl.EstimateGas(...) ; gasLimit = gasLimit + (gasLimit / 5)
-// 	// // chainID, err := ethCl.NetworkID(...)
-// 	//
-// 	// utils.Warningf("PrepareLiquidateAccountDirectTransaction is a placeholder and needs full nonce/gas/chainID logic and error handling.")
-// 	// // return &UnsignedTxDataForClient{ /* ... populate ... */ }, nil
-// 	return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction is a placeholder and not fully implemented")
-// }
+// It returns placeholder data for nonce, gas, and chainID, which must be implemented.
+func PrepareLiquidateAccountDirectTransaction(
+	hydro sdk.Hydro,
+	liquidatorAddress goEthereumCommon.Address, // The EOA that will send the liquidation transaction
+	userToLiquidate goEthereumCommon.Address,
+	marketID uint16,
+) (*UnsignedTxDataForClient, error) {
+	utils.Warningf("PrepareLiquidateAccountDirectTransaction is a placeholder and needs full implementation for nonce, gas, and chainID fetching for the liquidatorAddress: %s", liquidatorAddress.Hex())
+
+	if marginContractABI.Methods == nil { // Or check len(marginContractABI.Methods) == 0
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: Margin Contract ABI not initialized")
+	}
+	methodName := "liquidateAccount" // As per the Hydro.sol ABI provided by user
+	method, ok := marginContractABI.Methods[methodName]
+	if !ok {
+		// This assumes `liquidateAccount` is part of the marginContractABI.
+		// If it's on a different contract (e.g., a master Hydro contract), this check needs adjustment,
+		// or the method needs to be in marginContractABI.
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: method '%s' not found in Margin Contract ABI", methodName)
+	}
+
+	packedArgs, err := method.Inputs.Pack(userToLiquidate, marketID)
+	if err != nil {
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to pack args for '%s': %w", methodName, err)
+	}
+	fullTxData := append(method.ID, packedArgs...)
+
+	// TODO: Get ethCl from hydro instance
+	// TODO: Fetch nonce for liquidatorAddress using ethCl.PendingNonceAt(context.Background(), liquidatorAddress)
+	// TODO: Suggest gas price using ethCl.SuggestGasPrice(context.Background())
+	// TODO: Estimate gas limit for this call (from liquidatorAddress, to MarginContractAddress, data: fullTxData, value: big.NewInt(0))
+	// TODO: Fetch chainID using ethCl.NetworkID(context.Background())
+
+	currentNonce := uint64(0)                   // Placeholder
+	currentGasPrice := big.NewInt(20000000000)  // 20 Gwei placeholder
+	estimatedGasLimit := uint64(300000)       // Placeholder gas limit
+	currentChainID := big.NewInt(1)          // Mainnet placeholder, should be fetched
+	txValue := big.NewInt(0)                  // liquidateAccount is non-payable
+
+	// Using utils.Infof for consistency, assuming log.Printf might not be standard in this package's logging.
+	utils.Infof("PrepareLiquidateAccountDirectTransaction: Conceptual TX prepared for liquidator %s to liquidate user %s in market %d. Data: %s. NONCE/GAS ARE PLACEHOLDERS.",
+		liquidatorAddress.Hex(), userToLiquidate.Hex(), marketID, hexutil.Encode(fullTxData))
+
+	return &UnsignedTxDataForClient{
+		From:     liquidatorAddress.Hex(), // Changed to Hex() for consistency with UnsignedTxDataForClient struct
+		To:       MarginContractAddress.Hex(), // Target is the Margin Contract
+		Nonce:    currentNonce,
+		GasPrice: currentGasPrice.String(),
+		GasLimit: estimatedGasLimit,
+		Value:    txValue.String(),
+		Data:     hexutil.Encode(fullTxData),
+		ChainID:  currentChainID.String(),
+	}, nil
+}
+
 
 // GetOraclePriceInQuote fetches the price of assetToPrice in terms of quoteAsset by using their respective USD prices.
 // E.g., how many quoteAssets is one unit of assetToPrice worth? (assetToPrice_USD / quoteAsset_USD)
@@ -1367,7 +1425,7 @@ func BalanceOf(hydro sdk.Hydro, tokenAddress goEthereumCommon.Address, userAddre
 	if len(responseData) == 0 && method.Outputs.Length() > 0 {
 		return decimal.Zero, fmt.Errorf("BalanceOf: ERC20 %s call returned no data for token %s, user %s, but expected %d outputs", methodName, tokenAddress.Hex(), userAddress.Hex(), method.Outputs.Length())
 	}
-	
+
 	results, err := method.Outputs.Unpack(responseData)
 	if err != nil {
 		return decimal.Zero, fmt.Errorf("BalanceOf: failed to unpack %s result for token %s, user %s: %w. Raw data: %s", methodName, tokenAddress.Hex(), userAddress.Hex(), err, hexutil.Encode(responseData))

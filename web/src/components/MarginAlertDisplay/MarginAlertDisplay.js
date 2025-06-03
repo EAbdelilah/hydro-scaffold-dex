@@ -1,9 +1,12 @@
 import React from 'react';
 import { connect } from 'react-redux';
-import { getCurrentMarginAlert, isMarginAlertVisible } from '../../selectors/uiSelectors'; 
+import { getCurrentMarginAlert, isMarginAlertVisible } from '../../selectors/uiSelectors';
 import { hideMarginAlert } from '../../actions/notificationActions';
 // import './styles.scss'; // Optional: for styling
 
+// VERIFY_WS_UPDATE: When a MARGIN_ALERT message updates Redux state,
+// this component should become visible and display the correct alert message and level.
+// Test dismissal via hideMarginAlert().
 class MarginAlertDisplay extends React.PureComponent {
     getAlertClass = (level) => {
         switch (level ? level.toLowerCase() : '') {

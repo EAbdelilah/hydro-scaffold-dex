@@ -24,3 +24,7 @@ ReactDOM.render(
 // unregister() to register() below. Note this comes with some pitfalls.
 // Learn more about service workers: http://bit.ly/CRA-PWA
 serviceWorker.unregister();
+
+// Initialize WebSocket connection
+import { initializeWebSocket } from './services/websocketHandlers'; // Adjust path if necessary
+initializeWebSocket();

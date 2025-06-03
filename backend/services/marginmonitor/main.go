@@ -33,7 +33,7 @@ type MarginMonitorService struct {
 	db    *gorm.DB
 	hydro sdk.Hydro // Hydro SDK instance for blockchain interactions
 	redisClient *connection.RedisClient // For publishing messages
-	
+
 	// Configuration for monitoring logic
 	warningThresholdFactor  float64 // e.g., 1.2 (120% of liquidateRate)
 	criticalThresholdFactor float64 // e.g., 1.05 (105% of liquidateRate)
@@ -147,7 +147,7 @@ func (s *MarginMonitorService) getActiveUsersForMarket(marketID uint16) ([]commo
 // monitorPositions is the core loop that checks user positions.
 func (s *MarginMonitorService) monitorPositions() {
 	utils.Info("MarginMonitorService: Starting position monitoring cycle.")
-	
+
 	// 1. Fetch all oracle prices for relevant assets in this cycle
 	s.currentPrices = make(map[common.Address]*big.Int) // Clear previous prices
 	allAssetsToPrice := make(map[common.Address]bool)
@@ -210,24 +210,24 @@ func (s *MarginMonitorService) monitorPositions() {
 			// Calculate Current Collateral Ratio
 			var currentCollateralRatio *big.Int
 			if accountDetails.DebtsTotalUSDValue != nil && accountDetails.DebtsTotalUSDValue.Sign() > 0 {
-				currentCollateralRatio = new(big.Int).Mul(accountDetails.AssetsTotalUSDValue, utils.GetExp(18)) 
+				currentCollateralRatio = new(big.Int).Mul(accountDetails.AssetsTotalUSDValue, utils.GetExp(18))
 				currentCollateralRatio.Div(currentCollateralRatio, accountDetails.DebtsTotalUSDValue)
 			} else if accountDetails.AssetsTotalUSDValue != nil && accountDetails.AssetsTotalUSDValue.Sign() > 0 {
 				// No debt, or zero debt, and positive assets: ratio is effectively infinite.
-            	// Using a very large number (100 * 1e18, effectively 10000% if 1e18 is 100%)
+		// Using a very large number (100 * 1e18, effectively 10000% if 1e18 is 100%)
 				currentCollateralRatio = new(big.Int).Lsh(utils.GetExp(18), 7) // utils.GetExp(18) is 1e18. Lsh by 7 means multiply by 2^7 = 128. So 128 * 1e18.
                                                                          // This is a common way to represent a very large ratio. MaxAmount might be too large for some display purposes.
 			} else {
 				// No assets and no debt, or no assets and some debt (though latter implies already liquidated or error state)
-				currentCollateralRatio = big.NewInt(0) 
+				currentCollateralRatio = big.NewInt(0)
 			}
-			
+
 			utils.Infof("MarginMonitor: User %s, MarketID %d - AssetsUSD: %s, DebtsUSD: %s, Calculated Ratio (1e18): %s",
 				userAddress.Hex(), market.ID, accountDetails.AssetsTotalUSDValue.String(), accountDetails.DebtsTotalUSDValue.String(), currentCollateralRatio.String())
 
 
 			// Calculate Thresholds
-			liquidateRateFromMarket := market.LiquidateRate 
+			liquidateRateFromMarket := market.LiquidateRate
 			if liquidateRateFromMarket == nil || liquidateRateFromMarket.Sign() == 0 {
 				utils.Warningf("Market %d has invalid liquidateRate (%v), skipping alert checks for this market.", market.MarketID, liquidateRateFromMarket)
 				continue
@@ -278,7 +278,7 @@ func (s *MarginMonitorService) monitorPositions() {
 					delete(s.lastAlerts, positionKey) // Clear last alert time as it's healthy
 				}
 			}
-			
+
 			// Detailed Account Update Publishing (Significant Change or Initial)
 			previousState, prevStateExists := s.previousStates[positionKey]
 			ratioDiff := big.NewFloat(0)
@@ -287,7 +287,7 @@ func (s *MarginMonitorService) monitorPositions() {
 				ratioDiff = new(big.Float).Quo(new(big.Float).SetInt(diff), new(big.Float).SetInt(currentCollateralRatio))
 				ratioDiff.Abs(ratioDiff) // Absolute change
 			}
-			
+
 			significantChangeThresholdBigFloat := big.NewFloat(s.significantChangeThreshold)
 			hasSignificantChange := ratioDiff.Cmp(significantChangeThresholdBigFloat) >= 0
 
@@ -300,16 +300,16 @@ func (s *MarginMonitorService) monitorPositions() {
 
 				baseCollateralBal, errBaseBal := sdk_wrappers.MarketBalanceOf(s.hydro, market.MarketID, market.BaseAssetAddress, userAddress)
 				if errBaseBal != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching base balance for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errBaseBal); baseCollateralBal = big.NewInt(0) }
-				
+
 				quoteCollateralBal, errQuoteBal := sdk_wrappers.MarketBalanceOf(s.hydro, market.MarketID, market.QuoteAssetAddress, userAddress)
 				if errQuoteBal != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching quote balance for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errQuoteBal); quoteCollateralBal = big.NewInt(0) }
-				
+
 				baseBorrowedAmt, errBaseDebt := sdk_wrappers.GetAmountBorrowed(s.hydro, market.BaseAssetAddress, userAddress, market.MarketID)
 				if errBaseDebt != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching base debt for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errBaseDebt); baseBorrowedAmt = big.NewInt(0) }
-				
+
 				quoteBorrowedAmt, errQuoteDebt := sdk_wrappers.GetAmountBorrowed(s.hydro, market.QuoteAssetAddress, userAddress, market.MarketID)
 				if errQuoteDebt != nil { utils.Warningf("MarginMonitor/UpdatePayload: Error fetching quote debt for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errQuoteDebt); quoteBorrowedAmt = big.NewInt(0) }
-				
+
 				basePriceStr := "0"
 				if price, ok := s.currentPrices[market.BaseAssetAddress]; ok { basePriceStr = price.String() }
 				quotePriceStr := "0"
@@ -343,7 +343,7 @@ func (s *MarginMonitorService) monitorPositions() {
 				messagebus.PublishToUserQueue(s.redisClient.Client, userAddress.Hex(), "MARGIN_ACCOUNT_UPDATE", updatePayload)
 				utils.Infof("Published MARGIN_ACCOUNT_UPDATE for user %s, market %d (Significant Change or Initial)", userAddress.Hex(), market.MarketID)
 				s.previousStates[positionKey] = PositionState{
-					CollateralRatio: currentCollateralRatio, 
+					CollateralRatio: currentCollateralRatio,
 					AssetsTotalUSDValue: accountDetails.AssetsTotalUSDValue,
 					DebtsTotalUSDValue: accountDetails.DebtsTotalUSDValue,
 					Timestamp: now,
@@ -367,7 +367,7 @@ func (s *MarginMonitorService) monitorPositions() {
 				// TODO: Step 1: Check if an auction for this user/market is already in progress or recently concluded.
 				// This might involve querying an internal state (e.g., a local cache of active auctions being processed by this monitor instance)
 				// or a new SDK wrapper: e.g., isActiveAuction, err := sdk_wrappers.IsAuctionActiveForAccount(s.hydro, userAddress, market.MarketID)
-				// if err != nil { 
+				// if err != nil {
 				//     utils.Errorf("MarginMonitor: Error checking for active auction for user %s, market %d: %v", userAddress.Hex(), market.MarketID, err)
 				//     // Decide if to proceed or wait if check fails. For now, assume we might proceed cautiously.
 				// } else if isActiveAuction {
@@ -393,7 +393,7 @@ func (s *MarginMonitorService) monitorPositions() {
 				// }
 
 				// // 2.2. Get Unsigned Transaction Data (using a pre-configured liquidator EOA)
-				// liquidatorAddressStr := os.Getenv("HSK_LIQUIDATOR_ADDRESS") 
+				// liquidatorAddressStr := os.Getenv("HSK_LIQUIDATOR_ADDRESS")
 				// if liquidatorAddressStr == "" {
 				//      utils.Errorf("MarginMonitor: HSK_LIQUIDATOR_ADDRESS is not set. Cannot prepare liquidation tx.")
 				//      // return or continue
@@ -404,7 +404,7 @@ func (s *MarginMonitorService) monitorPositions() {
 				//     utils.Errorf("MarginMonitor: Conceptually failed to prepare liquidation tx for user %s, market %d: %v", userAddress.Hex(), market.MarketID, prepErr)
 				//      // return or continue
 				// }
-				
+
 				// // 3. Sign and Broadcast (if monitor handles this directly) OR Publish to dedicated queue
 				utils.Warningf("MarginMonitor: TODO - Step 3: Actually sign and broadcast liquidation for user %s, market %d, OR publish to dedicated liquidation queue.", userAddress.Hex(), market.MarketID)
 				// // Example if publishing:
@@ -447,7 +447,7 @@ func main() {
 		panic("HSK_MARGIN_CONTRACT_ADDRESS environment variable is not set for monitor.")
 	}
 	// Pass empty string for hydroContractAddressHex if only margin contract is used by wrappers in this service
-	if err := sdk_wrappers.InitHydroWrappers("", marginContractAddress); err != nil { 
+	if err := sdk_wrappers.InitHydroWrappers("", marginContractAddress); err != nil {
 		panic(fmt.Sprintf("Failed to initialize Hydro SDK Wrappers: %v", err))
 	}
 
@@ -467,7 +467,7 @@ func main() {
 		monitoringInterval = time.Duration(sec) * time.Second
 	}
 	utils.Infof("Margin Monitor Service: Monitoring interval set to %v", monitoringInterval)
-	ticker := time.NewTicker(monitoringInterval) 
+	ticker := time.NewTicker(monitoringInterval)
 	defer ticker.Stop()
 
 	for {

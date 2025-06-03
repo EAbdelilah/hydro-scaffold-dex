@@ -79,12 +79,12 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 		utils.Errorf("Not enough topics in log entry for event %s, tx %s to extract user and marketID", logEntry.GetEventName(), logEntry.GetTransactionHash())
 		return
 	}
-	
+
 	if len(logEntry.GetTopics()) > 3 {
 		specificAsset = ethcommon.BytesToAddress(logEntry.GetTopics()[3].Bytes()) // topic[3] is typically asset
 	}
 
-	var eventData struct{ Amount *big.Int } 
+	var eventData struct{ Amount *big.Int }
 
 	switch logEntry.GetEventName() {
 	case "IncreaseCollateral":
@@ -161,20 +161,20 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 		} else {
 			baseAssetAddr := ethcommon.HexToAddress(marketDBInfo.BaseTokenAddress)
 			quoteAssetAddr := ethcommon.HexToAddress(marketDBInfo.QuoteTokenAddress)
-			
+
 			baseDebt, errBaseDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
-			if errBaseDebt != nil { 
+			if errBaseDebt != nil {
 				utils.Warningf("Repay: Error fetching base debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errBaseDebt)
-				baseDebt = big.NewInt(0) 
+				baseDebt = big.NewInt(0)
 			}
 			quoteDebt, errQuoteDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
-			if errQuoteDebt != nil { 
+			if errQuoteDebt != nil {
 				utils.Warningf("Repay: Error fetching quote debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errQuoteDebt)
 				quoteDebt = big.NewInt(0)
 			}
 			newHasDebt := (baseDebt.Sign() > 0 || quoteDebt.Sign() > 0)
 			utils.Infof("Watcher/Repay: Post-event debts for user %s, market %d - Base: %s, Quote: %s. newHasDebt: %t", user.Hex(), eventMarketID_uint16, baseDebt.String(), quoteDebt.String(), newHasDebt)
-			
+
 			currentPos, dbErrGet := models.MarginActivePositionDaoSql.GetOrCreate(user.Hex(), eventMarketID_uint16)
 			if dbErrGet != nil {
 				utils.Errorf("Repay: GetOrCreate error: %v", dbErrGet)
@@ -185,10 +185,10 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 				}
 			}
 		}
-		
+
 	default:
 		utils.Debugf("Unhandled Margin Contract event type: %s from Tx %s", logEntry.GetEventName(), logEntry.GetTransactionHash())
-		return 
+		return
 	}
 
 	userAddressHex := user.Hex()
@@ -225,13 +225,13 @@ func (h *MarginContractEventHandler) Handle(logEntry structs.Log) {
 
 		baseCollateralBal, errBaseBal := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, baseAssetAddr, user)
 		if errBaseBal != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching base balance for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errBaseBal); baseCollateralBal = big.NewInt(0) }
-		
+
 		quoteCollateralBal, errQuoteBal := sdk_wrappers.MarketBalanceOf(h.hydroSDK, eventMarketID_uint16, quoteAssetAddr, user)
 		if errQuoteBal != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching quote balance for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errQuoteBal); quoteCollateralBal = big.NewInt(0) }
-		
+
 		baseBorrowedAmt, errBaseDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, baseAssetAddr)
 		if errBaseDebt != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching base debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errBaseDebt); baseBorrowedAmt = big.NewInt(0) }
-		
+
 		quoteBorrowedAmt, errQuoteDebt := sdk_wrappers.GetAmountBorrowed(h.hydroSDK, user, eventMarketID_uint16, quoteAssetAddr)
 		if errQuoteDebt != nil { utils.Warningf("Watcher/UpdatePayload: Error fetching quote debt for user %s, market %d: %v", user.Hex(), eventMarketID_uint16, errQuoteDebt); quoteBorrowedAmt = big.NewInt(0) }
 

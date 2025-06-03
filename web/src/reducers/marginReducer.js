@@ -36,33 +36,36 @@ import {
   INITIATE_CLOSE_MARGIN_POSITION_REQUEST,
   INITIATE_CLOSE_MARGIN_POSITION_UNSIGNED_TX_RECEIVED,
   INITIATE_CLOSE_MARGIN_POSITION_FAILURE,
-  INITIATE_REPAY_LOAN_REQUEST, // New types for repay loan flow
+  INITIATE_REPAY_LOAN_REQUEST,
   INITIATE_REPAY_LOAN_UNSIGNED_TX_RECEIVED,
   INITIATE_REPAY_LOAN_FAILURE,
-  HANDLE_MARGIN_ACCOUNT_UPDATE, 
-  HANDLE_MARGIN_ALERT,          
-  DISMISS_MARGIN_ALERT          
+  DEPOSIT_COLLATERAL_UNSIGNED_TX_RECEIVED, // Ensure these are imported
+  WITHDRAW_COLLATERAL_UNSIGNED_TX_RECEIVED,
+  BORROW_LOAN_UNSIGNED_TX_RECEIVED,
+  HANDLE_MARGIN_ACCOUNT_UPDATE,
+  HANDLE_MARGIN_ALERT,
+  DISMISS_MARGIN_ALERT
 } from '../actions/marginActions';
 
 const initialState = fromJS({
-  accountDetailsByMarket: {}, 
-  loansByMarket: {},          
-  openPositions: {            
+  accountDetailsByMarket: {},
+  loansByMarket: {},
+  openPositions: {
     list: [],
     isLoading: false,
     error: null,
   },
-  marginSpendableBalances: {}, 
-  unsignedMarginTx: null,      
-  lastMarginTxHash: null,      
+  marginSpendableBalances: {},
+  unsignedMarginTx: null,
+  lastMarginTxHash: null,
   ui: {
-    selectedAccountType: 'spot', 
+    selectedAccountType: 'spot',
     getMarginAccountDetailsLoading: {},
     getMarginAccountDetailsError: {},
     getLoansLoading: {}, // This might be a map by marketID if fetchLoans is market-specific
     getLoansError: {},   // This might be a map by marketID
-    fetchSpendableMarginBalanceLoading: {}, 
-    fetchSpendableMarginBalanceError: {},   
+    fetchSpendableMarginBalanceLoading: {},
+    fetchSpendableMarginBalanceError: {},
     depositCollateralLoading: false,
     depositCollateralError: null,
     withdrawCollateralLoading: false,
@@ -72,14 +75,14 @@ const initialState = fromJS({
     repayLoanLoading: false, // Original direct repay loading flag
     repayLoanError: null,   // Original direct repay error flag
 
-    isOpeningMarginPosition: false, 
-    isClosingMarginPosition: false, 
+    isOpeningMarginPosition: false,
+    isClosingMarginPosition: false,
     isProcessingRepayLoan: false, // New specific flag for repaying loan
-    isSigningInWallet: false, 
+    isSigningInWallet: false,
     isBroadcastingMarginTx: false,
-    marginActionError: null, 
+    marginActionError: null,
 
-    activeMarginAlerts: List(), 
+    activeMarginAlerts: List(),
   }
 });
 
@@ -102,16 +105,16 @@ export default function marginReducer(state = initialState, action) {
         .setIn(['ui', 'getMarginAccountDetailsError', action.payload.marketID], action.payload.error);
 
     case FETCH_LOANS_REQUEST: // Assuming fetchLoans can be general or market specific
-      let loadingPath = action.payload.marketID 
-        ? ['ui', 'getLoansLoading', action.payload.marketID] 
+      let loadingPath = action.payload.marketID
+        ? ['ui', 'getLoansLoading', action.payload.marketID]
         : ['ui', 'getLoansLoading', 'all']; // Example for a global flag
       let errorPath = action.payload.marketID
         ? ['ui', 'getLoansError', action.payload.marketID]
         : ['ui', 'getLoansError', 'all'];
       return state.setIn(loadingPath, true).setIn(errorPath, null);
     case FETCH_LOANS_SUCCESS: // Stores loans by marketID even if fetched all
-      let successLoadingPath = action.payload.marketID 
-        ? ['ui', 'getLoansLoading', action.payload.marketID] 
+      let successLoadingPath = action.payload.marketID
+        ? ['ui', 'getLoansLoading', action.payload.marketID]
         : ['ui', 'getLoansLoading', 'all'];
       if (action.payload.marketID) { // Specific market update
         return state
@@ -126,8 +129,8 @@ export default function marginReducer(state = initialState, action) {
         return state.setIn(successLoadingPath, false);
       }
     case FETCH_LOANS_FAILURE:
-      let failureLoadingPath = action.payload.marketID 
-      ? ['ui', 'getLoansLoading', action.payload.marketID] 
+      let failureLoadingPath = action.payload.marketID
+      ? ['ui', 'getLoansLoading', action.payload.marketID]
       : ['ui', 'getLoansLoading', 'all'];
       let failureErrorPath = action.payload.marketID
         ? ['ui', 'getLoansError', action.payload.marketID]
@@ -160,17 +163,90 @@ export default function marginReducer(state = initialState, action) {
       return state
         .setIn(['openPositions', 'isLoading'], false)
         .setIn(['openPositions', 'error'], action.payload.error);
-    
+
+    // Deposit Collateral
+    case DEPOSIT_COLLATERAL_REQUEST:
+      return state
+        .setIn(['ui', 'depositCollateralLoading'], true)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false);
+    case DEPOSIT_COLLATERAL_UNSIGNED_TX_RECEIVED:
+      return state
+        .setIn(['ui', 'depositCollateralLoading'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
+    case DEPOSIT_COLLATERAL_FAILURE:
+      return state
+        .setIn(['ui', 'depositCollateralLoading'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    // Withdraw Collateral
+    case WITHDRAW_COLLATERAL_REQUEST:
+      return state
+        .setIn(['ui', 'withdrawCollateralLoading'], true)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false);
+    case WITHDRAW_COLLATERAL_UNSIGNED_TX_RECEIVED:
+      return state
+        .setIn(['ui', 'withdrawCollateralLoading'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
+    case WITHDRAW_COLLATERAL_FAILURE:
+      return state
+        .setIn(['ui', 'withdrawCollateralLoading'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    // Borrow Loan
+    case BORROW_LOAN_REQUEST:
+      return state
+        .setIn(['ui', 'borrowLoanLoading'], true)
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false);
+    case BORROW_LOAN_UNSIGNED_TX_RECEIVED:
+      return state
+        .setIn(['ui', 'borrowLoanLoading'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
+    case BORROW_LOAN_FAILURE:
+      return state
+        .setIn(['ui', 'borrowLoanLoading'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    // Repay Loan (already has INITIATE_REPAY_LOAN_... which is fine)
+    case INITIATE_REPAY_LOAN_REQUEST: // Renamed from REPAY_LOAN_REQUEST if it was different
+      return state
+        .setIn(['ui', 'isProcessingRepayLoan'], true) // Keeps isProcessingRepayLoan
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'marginActionError'], null)
+        .setIn(['ui', 'isSigningInWallet'], false);
+    case INITIATE_REPAY_LOAN_UNSIGNED_TX_RECEIVED: // Renamed from REPAY_LOAN_UNSIGNED_TX_RECEIVED
+      return state
+        .setIn(['ui', 'isProcessingRepayLoan'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
+    case INITIATE_REPAY_LOAN_FAILURE: // Renamed from REPAY_LOAN_FAILURE
+      return state
+        .setIn(['ui', 'isProcessingRepayLoan'], false)
+        .setIn(['ui', 'isSigningInWallet'], false)
+        .setIn(['ui', 'marginActionError'], action.payload.error)
+        .set('unsignedMarginTx', null);
+
+    // Open Margin Position
     case OPEN_MARGIN_POSITION_REQUEST:
       return state
         .setIn(['ui', 'isOpeningMarginPosition'], true)
         .set('unsignedMarginTx', null)
         .setIn(['ui', 'marginActionError'], null)
-        .setIn(['ui', 'isSigningInWallet'], false); 
+        .setIn(['ui', 'isSigningInWallet'], false);
     case OPEN_MARGIN_POSITION_UNSIGNED_TX_RECEIVED:
       return state
-        .setIn(['ui', 'isOpeningMarginPosition'], false) 
-        .set('unsignedMarginTx', fromJS(action.payload)); 
+        .setIn(['ui', 'isOpeningMarginPosition'], false)
+        .set('unsignedMarginTx', fromJS(action.payload));
     case OPEN_MARGIN_POSITION_FAILURE:
       return state
         .setIn(['ui', 'isOpeningMarginPosition'], false)
@@ -195,53 +271,42 @@ export default function marginReducer(state = initialState, action) {
         .setIn(['ui', 'marginActionError'], action.payload.error)
         .set('unsignedMarginTx', null);
 
-    case INITIATE_REPAY_LOAN_REQUEST:
-      return state
-        .setIn(['ui', 'isProcessingRepayLoan'], true)
-        .set('unsignedMarginTx', null)
-        .setIn(['ui', 'marginActionError'], null)
-        .setIn(['ui', 'isSigningInWallet'], false);
-    case INITIATE_REPAY_LOAN_UNSIGNED_TX_RECEIVED:
-      return state
-        .setIn(['ui', 'isProcessingRepayLoan'], false)
-        .set('unsignedMarginTx', fromJS(action.payload));
-    case INITIATE_REPAY_LOAN_FAILURE:
-      return state
-        .setIn(['ui', 'isProcessingRepayLoan'], false)
-        .setIn(['ui', 'isSigningInWallet'], false)
-        .setIn(['ui', 'marginActionError'], action.payload.error)
-        .set('unsignedMarginTx', null);
-
     case SIGNING_MARGIN_TRANSACTION_PENDING:
       return state
         .setIn(['ui', 'isSigningInWallet'], true)
-        .setIn(['ui', 'marginActionError'], null); 
-    case SIGNING_MARGIN_TRANSACTION_COMPLETE: 
+        .setIn(['ui', 'marginActionError'], null);
+    case SIGNING_MARGIN_TRANSACTION_COMPLETE:
       return state.setIn(['ui', 'isSigningInWallet'], false);
 
     case BROADCAST_MARGIN_TRANSACTION_REQUEST:
       return state
         .setIn(['ui', 'isBroadcastingMarginTx'], true)
-        .setIn(['ui', 'isSigningInWallet'], false) 
+        .setIn(['ui', 'isSigningInWallet'], false)
         .setIn(['ui', 'marginActionError'], null);
     case BROADCAST_MARGIN_TRANSACTION_SUCCESS:
       return state
         .setIn(['ui', 'isBroadcastingMarginTx'], false)
         .set('lastMarginTxHash', action.payload.transactionHash)
         .set('unsignedMarginTx', null)
-        .setIn(['ui', 'isSigningInWallet'], false)
-        .setIn(['ui', 'isOpeningMarginPosition'], false) 
+        .setIn(['ui', 'isSigningInWallet'], false) // Ensure signing is also complete
+        .setIn(['ui', 'isOpeningMarginPosition'], false)
         .setIn(['ui', 'isClosingMarginPosition'], false)
-        .setIn(['ui', 'isProcessingRepayLoan'], false); // Reset this too
+        .setIn(['ui', 'isProcessingRepayLoan'], false)
+        .setIn(['ui', 'depositCollateralLoading'], false)   // Reset these too
+        .setIn(['ui', 'withdrawCollateralLoading'], false)
+        .setIn(['ui', 'borrowLoanLoading'], false);
     case BROADCAST_MARGIN_TRANSACTION_FAILURE:
       return state
         .setIn(['ui', 'isBroadcastingMarginTx'], false)
         .setIn(['ui', 'marginActionError'], action.payload.error)
-        .set('unsignedMarginTx', null) 
-        .setIn(['ui', 'isSigningInWallet'], false)
-        .setIn(['ui', 'isOpeningMarginPosition'], false) 
+        .set('unsignedMarginTx', null)
+        .setIn(['ui', 'isSigningInWallet'], false) // Ensure signing is also complete
+        .setIn(['ui', 'isOpeningMarginPosition'], false)
         .setIn(['ui', 'isClosingMarginPosition'], false)
-        .setIn(['ui', 'isProcessingRepayLoan'], false); // Reset this too
+        .setIn(['ui', 'isProcessingRepayLoan'], false)
+        .setIn(['ui', 'depositCollateralLoading'], false)   // Reset these too
+        .setIn(['ui', 'withdrawCollateralLoading'], false)
+        .setIn(['ui', 'borrowLoanLoading'], false);
 
     case HANDLE_MARGIN_ACCOUNT_UPDATE:
       if (action.payload && action.payload.marketID) {

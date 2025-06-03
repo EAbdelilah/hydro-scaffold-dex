@@ -67,8 +67,12 @@ const api = {
   repayLoan: (data) => { // data: { marketID, assetAddress, amount }
     return _request('post', '/margin/loans/repay', data);
   },
-  getLoans: (marketID, userAddress) => {
-    return _request('get', `/margin/loans?marketID=${marketID}&user=${userAddress}`);
+  getLoans: (marketID = null) => { // userAddress removed, handled by auth; marketID is optional
+    let url = '/v1/margin/loans?includeInterestRates=true';
+    if (marketID) {
+      url += `&marketID=${marketID}`;
+    }
+    return _request('get', url);
   },
 
   // Open Margin Position
@@ -87,12 +91,8 @@ const api = {
   },
 
   // Open Positions (Margin)
-  getOpenPositions: (userAddress) => { // userAddress might be optional if backend uses auth token
-    let url = '/v1/margin/positions';
-    if (userAddress) {
-      url += `?userAddress=${userAddress}`;
-    }
-    return _request('get', url);
+  getOpenPositions: () => { // userAddress removed, handled by auth
+    return _request('get', '/v1/margin/positions');
   },
 
   // Market Margin Parameters

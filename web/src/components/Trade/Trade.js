@@ -1,12 +1,15 @@
 import React, { Component } from 'react';
 import { connect } from 'react-redux';
 import { BigNumber } from 'bignumber.js';
-import { 
-  openMarginPosition, 
+import {
+  openMarginPosition,
   // broadcastMarginTransaction, // Not dispatched directly from component anymore
   // initiateCloseMarginPosition // Not part of this component's direct responsibility
 } from '../../actions/marginActions';
 import { getSelectedAccountType } from '../../selectors/marginSelectors';
+import { clearTradeFormPrefill } from '../../actions/uiActions'; // Import new action
+import { selectAccountType } from '../../actions/marginActions'; // For switching to margin
+import { setCurrentMarket } from '../../actions/market'; // Assuming this action exists
 // import { TRADE_FORM_ID, clearTradeForm } from '../../actions/trade'; // clearTradeForm is dispatched by thunk
 
 // Conceptual: For a real form, you'd likely use redux-form or a similar library
@@ -15,12 +18,52 @@ class Trade extends Component {
   constructor(props) {
     super(props);
     this.state = {
-      side: 'buy', 
-      amount: '1', 
-      price: '100', 
-      leverage: '2.5', 
+      side: 'buy',
+      amount: '', // Default to empty for prefill
+      price: '',  // Default to empty for prefill
+      leverage: '2.5',
+      orderType: 'limit', // Default order type
     };
   }
+
+  componentDidUpdate(prevProps) {
+    const { dispatch, tradeFormPrefill, currentMarket } = this.props; // Added dispatch here
+    if (tradeFormPrefill && tradeFormPrefill.get('active') &&
+        (!prevProps.tradeFormPrefill || !prevProps.tradeFormPrefill.get('active'))) {
+
+        const prefillData = tradeFormPrefill;
+
+        // Ensure current market is set to prefillData.get('marketID')
+        if (!currentMarket || currentMarket.id !== prefillData.get('marketID')) {
+           dispatch(setCurrentMarket(prefillData.get('marketID')));
+        }
+
+        dispatch(selectAccountType('margin')); // Switch to margin mode
+        this.setState({
+          side: prefillData.get('side'),
+          amount: prefillData.get('amount'),
+          price: prefillData.get('price') || '', // Use suggested price or empty for limit
+          // leverage: this.state.leverage, // Keep current leverage or reset? For closing, leverage isn't directly used in form.
+        });
+        // Potentially set orderType to 'limit' or 'market' based on prefill or default.
+        // For closing, it's usually a limit or market order to take liquidity.
+        // this.setState({ orderType: 'limit' });
+
+        dispatch(clearTradeFormPrefill()); // Clear the prefill state
+    }
+  }
+
+  componentWillUnmount() {
+    this.props.dispatch(clearTradeFormPrefill());
+  }
+
+  // componentDidUpdate(prevProps) { // Existing one is fine, just add comment conceptually
+  //   ...
+  //   // VERIFY_WS_UPDATE: If prevProps.assetsTotalUSD !== this.props.assetsTotalUSD (due to WebSocket MARGIN_ACCOUNT_UPDATE),
+  //   // ensure updateMarginTradeCalculations() (if such a helper exists for re-calculating collateral requirements etc.)
+  //   // is called and UI reflects changes if it affects form validation or displayed available balances.
+  //   // Also, if order book data (used for price clicking) is updated via WS, ensure it reflects.
+  // }
 
   handleInputChange = (event) => {
     this.setState({ [event.target.name]: event.target.value });
@@ -28,24 +71,24 @@ class Trade extends Component {
 
   handleSubmit = async (event) => {
     event.preventDefault();
-    const { 
-      dispatch, 
-      selectedAccountType, 
-      currentMarket, 
+    const {
+      dispatch,
+      selectedAccountType,
+      currentMarket,
       userAddress,
       // For spendable balance check (conceptual)
-      // baseAssetSymbol, 
+      // baseAssetSymbol,
       // quoteAssetSymbol,
       // getSpendableCommonBalance // Selector needed if checking common balance
     } = this.props;
-    
+
     const { side, amount, price, leverage } = this.state;
 
     if (!currentMarket || !userAddress) {
       alert('Market or User Address not available. Please connect your wallet and select a market.');
       return;
     }
-    
+
     // Convert inputs to BigNumber for validation and calculation
     const amountBN = new BigNumber(amount);
     const priceBN = new BigNumber(price);
@@ -62,7 +105,7 @@ class Trade extends Component {
         return;
       }
       console.log('Attempting to open margin position');
-      
+
       const baseAssetSymbol = currentMarket.get('baseToken');
       const quoteAssetSymbol = currentMarket.get('quoteToken');
       let collateralAmountDecimal;
@@ -71,10 +114,10 @@ class Trade extends Component {
       // Simplified collateral calculation: (amount * price) / leverage
       // Assumes collateral is always in the quote currency of the market.
       // This might need adjustment based on actual margin system rules (e.g., cross-margin, specific collateral asset).
-      const positionValueInQuote = amountBN.times(priceBN); 
+      const positionValueInQuote = amountBN.times(priceBN);
       collateralAmountDecimal = positionValueInQuote.div(leverageBN);
-      collateralAssetSymbol = quoteAssetSymbol; 
-      
+      collateralAssetSymbol = quoteAssetSymbol;
+
       // Conceptual: Client-side hint for available balance (backend will do the definitive check)
       // const spendableCollateral = getSpendableCommonBalance(this.props.state, collateralAssetSymbol); // Needs this selector
       // if (collateralAmountDecimal.gt(spendableCollateral)) {
@@ -90,14 +133,14 @@ class Trade extends Component {
         leverage: leverageBN.toNumber(),
         collateralAssetSymbol,
         collateralAmount: collateralAmountDecimal.toString(),
-        userAddress, 
+        userAddress,
         baseAssetSymbol, // For refresh action context
         quoteAssetSymbol // For refresh action context
       };
 
       try {
         // Dispatch the thunk that handles API call, signing, and broadcasting
-        await dispatch(openMarginPosition(params)); 
+        await dispatch(openMarginPosition(params));
       } catch (error) {
         // Errors are handled by Redux state, but can catch here for component-specific feedback if needed
         console.error('Open margin position initiation failed (component-level catch):', error);
@@ -113,21 +156,21 @@ class Trade extends Component {
   };
 
   render() {
-    const { 
+    const {
       selectedAccountType,
       isOpeningMarginPosition,
       isClosingMarginPosition, // For disabling button if a close is in progress
-      isSigningInWallet, 
-      isBroadcastingMarginTx, 
+      isSigningInWallet,
+      isBroadcastingMarginTx,
       marginActionError,
-      unsignedMarginTx, 
+      unsignedMarginTx,
       lastMarginTxHash,
       currentMarket
     } = this.props;
 
     const isProcessingMarginAction = isOpeningMarginPosition || isClosingMarginPosition || isSigningInWallet || isBroadcastingMarginTx;
     // Basic validation for enabling submit button (can be more sophisticated)
-    const isFormInputValid = parseFloat(this.state.amount) > 0 && parseFloat(this.state.price) > 0 && 
+    const isFormInputValid = parseFloat(this.state.amount) > 0 && parseFloat(this.state.price) > 0 &&
                              (selectedAccountType !== 'margin' || parseFloat(this.state.leverage) > 0);
 
 
@@ -159,7 +202,7 @@ class Trade extends Component {
             </div>
           )}
           <button type="submit" disabled={isProcessingMarginAction || !isFormInputValid}>
-            {isOpeningMarginPosition ? 'Preparing Trade...' : 
+            {isOpeningMarginPosition ? 'Preparing Trade...' :
              isSigningInWallet ? 'Awaiting Signature...' :
              isBroadcastingMarginTx ? 'Broadcasting...' :
              (selectedAccountType === 'margin' ? 'Open Margin Position' : 'Place Spot Order')}
@@ -181,9 +224,9 @@ class Trade extends Component {
               </div>
             )}
             {isBroadcastingMarginTx && <p>Broadcasting transaction to the network...</p>}
-            {lastMarginTxHash && !marginActionError && ( // Show only if no new error
+            {lastMarginTxHash && !marginActionError && !isProcessingMarginAction && (
               <p style={{ color: 'green' }}>
-                Margin transaction successfully broadcasted! Hash: {lastMarginTxHash}
+                Margin transaction successfully broadcasted! Hash: {this.props.lastMarginTxHash}
               </p>
             )}
             {marginActionError && (
@@ -200,26 +243,27 @@ class Trade extends Component {
 
 const mapStateToProps = (state) => {
   const currentMarket = state.market.getIn(['markets', 'currentMarket']);
-  const userAddress = state.account.get('address'); 
+  const userAddress = state.account.get('address');
   const marginUIState = state.margin.get('ui');
   const marginRootState = state.margin;
 
 
   return {
-    selectedAccountType: getSelectedAccountType(state), 
+    selectedAccountType: getSelectedAccountType(state),
     currentMarket,
     userAddress,
     // Specific UI states for opening/closing a margin position
     isOpeningMarginPosition: marginUIState.get('isOpeningMarginPosition', false),
     isClosingMarginPosition: marginUIState.get('isClosingMarginPosition', false), // For disabling button generally
-    
-    isSigningInWallet: marginUIState.get('isSigningInWallet', false), 
-    unsignedMarginTx: marginRootState.get('unsignedMarginTx'), 
+
+    isSigningInWallet: marginUIState.get('isSigningInWallet', false),
+    unsignedMarginTx: marginRootState.get('unsignedMarginTx'),
     isBroadcastingMarginTx: marginUIState.get('isBroadcastingMarginTx', false),
     marginActionError: marginUIState.get('marginActionError'), // Generalized error
-    lastMarginTxHash: marginRootState.get('lastMarginTxHash'), 
+    lastMarginTxHash: marginRootState.get('lastMarginTxHash'),
     // Example for form submitting state if using redux-form
-    // submitting: state.form[TRADE_FORM_ID] ? state.form[TRADE_FORM_ID].submitting : false, 
+    // submitting: state.form[TRADE_FORM_ID] ? state.form[TRADE_FORM_ID].submitting : false,
+    tradeFormPrefill: state.ui.get('tradeFormPrefill') // Map the prefill state
   };
 };
 
