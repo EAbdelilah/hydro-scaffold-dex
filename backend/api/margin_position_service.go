@@ -493,33 +493,16 @@ func CloseMarginPosition(c echo.Context) error {
 	if sdk_wrappers.MarginContractAddress == (goEthereumCommon.Address{}) {
 		return NewError(http.StatusInternalServerError, "Margin contract address not initialized")
 	}
-	var marginContractABIForPack abi.ABI
-	marginContractABIForPack, err = abi.JSON(strings.NewReader(sdk_wrappers.MarginContractABIJsonString))
+	// --- Prepare Unsigned Transaction using SDK Wrapper ---
+	// Value for batch actions on MarginContract (which is payable) is typically 0
+	// for repay/withdraw type actions unless an action itself requires sending ETH.
+	txValue := big.NewInt(0)
+	unsignedTxData, err := sdk_wrappers.PrepareBatchActionsTransaction(hydroSDK, actions, userAddress, txValue)
 	if err != nil {
-		return NewError(http.StatusInternalServerError, "Failed to parse margin contract ABI for packing")
-	}
-	packedBatchData, err := marginContractABIForPack.Pack("batch", actions)
-	if err != nil {
-		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to pack batch actions for closing position: %v", err))
-	}
-
-	nonce := uint64(0)
-	gasPrice := big.NewInt(20000000000)
-	gasLimit := uint64(1000000)
-	chainIdBigInt, _ := hydroSDK.GetChainID(context.Background())
-
-
-	unsignedTxForClient := &common.UnsignedTxDataForClient{
-		From:     userAddress.Hex(),
-		To:       sdk_wrappers.MarginContractAddress.Hex(),
-		Value:    "0",
-		Data:     goEthereumCommon.Bytes2Hex(packedBatchData),
-		Nonce:    fmt.Sprintf("%d", nonce),
-		GasPrice: gasPrice.String(),
-		GasLimit: fmt.Sprintf("%d", gasLimit),
-		ChainID: chainIdBigInt.String(),
+		utils.Errorf("CloseMarginPosition: Failed to prepare batch actions transaction data: %v", err)
+		return NewError(http.StatusInternalServerError, fmt.Sprintf("Failed to prepare transaction data: %v", err))
 	}
 
 	utils.Info("Successfully prepared unsigned transaction for closing margin position in market %s.", req.MarketID)
-	return c.JSON(http.StatusOK, unsignedTxForClient)
+	return c.JSON(http.StatusOK, unsignedTxData)
 }

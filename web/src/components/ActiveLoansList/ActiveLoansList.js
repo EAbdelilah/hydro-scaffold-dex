@@ -12,7 +12,11 @@ import {
   getAllActiveLoansList,
   getLoansLoading, // For specific market
   getAnyLoanLoadingState, // For general loading state if fetching all
-  getMarginActionError // Using generalized error
+  getMarginActionError, // Using generalized error
+  getIsSigningInWallet, // For button disabling
+  getIsBroadcastingMarginTx, // For button disabling
+  // Assuming a selector for repay loan processing state, e.g.:
+  getIsProcessingRepayLoan // Import or define this selector
 } from '../../selectors/marginSelectors';
 import { getSelectedAccount } from '@gongddex/hydro-sdk-wallet';
 
@@ -86,8 +90,22 @@ class ActiveLoansList extends Component {
   };
 
   render() {
+    // VERIFY_WS_UPDATE:
+    // If MARGIN_ACCOUNT_UPDATE messages lead to changes in derived loan data
+    // (e.g., if `getLoansForMarket` or `getAllActiveLoansList` selectors recompute based on `accountDetailsByMarket`),
+    // this list should reflect those changes (e.g., loan disappearing after full repayment and settlement).
+
     // If marketID is a prop, use specific loading state, otherwise general.
-    const { isLoading, error, loansList, marketsData, marketID } = this.props;
+    const {
+      error,
+      loansList,
+      marketsData,
+      marketID,
+      isProcessingRepayLoan, // Mapped from props
+      isSigningInWallet,       // Mapped from props
+      isBroadcastingMarginTx   // Mapped from props
+    } = this.props;
+    // Use isLoadingSpecificMarket or isAnyLoanLoading for the general page loading indicator
     const displayIsLoading = marketID ? this.props.isLoadingSpecificMarket : this.props.isAnyLoanLoading;
 
 
@@ -109,10 +127,15 @@ class ActiveLoansList extends Component {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr>
+              {/* {!marketID && <th style={tableHeaderStyle} title="Market context of the loan">Market</th>} */}
               {!marketID && <th style={tableHeaderStyle}>Market</th>}
+              {/* <th style={tableHeaderStyle} title="The asset that was borrowed">Asset</th> */}
               <th style={tableHeaderStyle}>Asset</th>
+              {/* <th style={tableHeaderStyle} title="Total amount currently borrowed, including principal and accrued interest">Amount Borrowed</th> */}
               <th style={tableHeaderStyle}>Amount Borrowed</th>
+              {/* <th style={tableHeaderStyle} title="Estimated Annual Percentage Yield for this loan">APY</th> */}
               <th style={tableHeaderStyle}>APY</th>
+              {/* <th style={tableHeaderStyle} title="Estimated interest accrued since the loan was taken or last compounded (N/A if not tracked)">Accrued Interest</th> */}
               <th style={tableHeaderStyle}>Accrued Interest</th>
               <th style={tableHeaderStyle}>Actions</th>
             </tr>
@@ -134,19 +157,33 @@ class ActiveLoansList extends Component {
 
 
               const amountBorrowed = new BigNumber(loan.get('amountBorrowed', '0'));
-              const interestRateAPY = new BigNumber(loan.get('currentInterestRate', '0')); // Assuming this is APY like 0.05 for 5%
-              const accruedInterest = new BigNumber(loan.get('accruedInterest', '0')); // Assuming this field is added to loan data
+              const interestRateAPYStr = loan.get('interestRateAPY', 'N/A');
+              const accruedInterestStr = loan.get('accruedInterest', 'N/A'); // Get as string first
+
+              let displayAccruedInterest = "N/A";
+              if (accruedInterestStr && accruedInterestStr !== "N/A" && !accruedInterestStr.includes("TODO")) {
+                const accruedInterestBn = new BigNumber(accruedInterestStr);
+                if (accruedInterestBn.isFinite()) {
+                  displayAccruedInterest = accruedInterestBn.toFormat(assetDecimals);
+                }
+              }
 
               return (
                 <tr key={`${loanMarketID}-${assetSymbol}-${index}`} style={tableRowStyle}>
                   {!marketID && <td style={tableCellStyle}>{marketSymbol}</td>}
                   <td style={tableCellStyle}>{assetSymbol}</td>
                   <td style={tableCellStyle}>{amountBorrowed.toFormat(assetDecimals)}</td>
-                  <td style={tableCellStyle}>{interestRateAPY.times(100).toFormat(2)}%</td>
-                  <td style={tableCellStyle}>{accruedInterest.toFormat(assetDecimals)}</td>
+                  <td style={tableCellStyle}>{interestRateAPYStr}</td>
+                  <td style={tableCellStyle}>{displayAccruedInterest}</td>
                   <td style={tableCellStyle}>
-                    <button onClick={() => this.handleRepay(loan)}>Repay Full</button>
+                    <button
+                      onClick={() => this.handleRepay(loan)}
+                      disabled={isProcessingRepayLoan || isSigningInWallet || isBroadcastingMarginTx}
+                    >
+                      Repay Full
+                    </button>
                     {/* TODO: Add input for partial repay amount */}
+                    {/* TODO: Add loading state for individual 'Repay' button click if needed */}
                   </td>
                 </tr>
               );
@@ -166,17 +203,20 @@ const tableCellStyle = { padding: '8px', textAlign: 'left' };
 const mapStateToProps = (state, ownProps) => {
   const selectedAccount = getSelectedAccount(state);
   const userAddress = selectedAccount ? selectedAccount.get('address') : null;
-  const marketID = ownProps.marketID; // If component is used for a specific market
+  const marketID = ownProps.marketID;
 
   return {
-    // If marketID is passed, get loans for that market. Otherwise, get all aggregated loans.
     loansList: marketID ? getLoansForMarket(state, marketID) : getAllActiveLoansList(state),
     isLoadingSpecificMarket: marketID ? getLoansLoading(state, marketID) : false,
-    isAnyLoanLoading: getAnyLoanLoadingState(state), // General loading for all loans
-    error: state.margin.getIn(['ui', 'marginActionError']), // Use generalized error
+    isAnyLoanLoading: getAnyLoanLoadingState(state),
+    error: state.margin.getIn(['ui', 'marginActionError']), // Or a more specific getLoansError(state)
     userAddress,
     marketsData: state.market.getIn(['markets', 'data'], Map()),
-    marketID // Pass marketID to component for context
+    marketID,
+    // Map loading states for the "Repay" button
+    isProcessingRepayLoan: state.margin.getIn(['ui', 'isInitiatingRepayLoan'], false), // Example direct access
+    isSigningInWallet: getIsSigningInWallet(state),
+    isBroadcastingMarginTx: getIsBroadcastingMarginTx(state)
   };
 };
 

@@ -44,6 +44,9 @@ const createOrder = (side, price, amount, orderType, expires) => {
       buildOrderPayload.accountType = 'margin';
       // marginMarketID is typically the same as marketID for the current context of placing an order in that market's margin pool
       buildOrderPayload.marginMarketID = currentMarket.id;
+      // TODO: Backend /orders/build API needs to handle accountType and marginMarketID
+      // to construct Order.data correctly for margin trades (using sdk_wrappers.GenerateMarginOrderDataHex
+      // with appropriate balanceCategory and orderDataMarketID).
     }
     // If not 'margin', accountType can be omitted as backend `BuildOrderReq` has it as omitempty.
 
@@ -65,6 +68,15 @@ const createOrder = (side, price, amount, orderType, expires) => {
         method: 0
       });
 
+      // TODO: Notification for successful closing trade.
+      // This requires 'isClosingTradeContext' to be passed into createOrder, or another way to know the context.
+      // if (isClosingTradeContext && placeOrderResponse.data.status === 0) {
+      //   dispatch(showMarginAlert({ // Assuming showMarginAlert is imported or passed to dispatch
+      //     level: 'info',
+      //     message: 'Closing trade confirmed. If position is flat, you can now "Settle & Withdraw" from Open Positions.',
+      //     autoDismiss: 10000
+      //   }));
+      // }
       return placeOrderResponse.data;
     } catch (e) {
       alert(e);

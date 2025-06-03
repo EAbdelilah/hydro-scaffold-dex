@@ -192,20 +192,21 @@ func (h *HydroApi) GetLoans(c echo.Context) error {
 				AssetAddress:    market.BaseTokenAddress,
 				AssetSymbol:     market.BaseTokenSymbol,
 				BorrowedAmount:  utils.BigWeiToDecimal(baseBorrowedBigInt, int32(market.BaseTokenDecimals)).StringFixed(market.AmountPrecision),
-				AccruedInterest: "N/A", // Placeholder
+				// TODO: Implement AccruedInterest. This requires knowing the initial principal and borrow time
+				// for each loan component, typically from off-chain storage (e.g., a 'margin_loan_history' table).
+				// Current 'BorrowedAmount' from contract includes accrued interest.
+				AccruedInterest: "N/A",
 			}
 			if req.IncludeInterestRates {
 				rates, rateErr := sw.GetInterestRates(hydroSDK, baseAssetAddr, big.NewInt(0)) // extraBorrowAmount = 0 for current rate
 				if rateErr == nil && rates != nil && rates.BorrowInterestRate != nil {
-					// Placeholder APY calculation - assumes rate is per second and 1e18 scaled.
-					// Real APY = (1 + rate_per_period)^periods_per_year - 1
-					// If rates.BorrowInterestRate is per second (e.g., 1e18 * 0.00000000X)
-					ratePerSecond := decimal.NewFromBigInt(rates.BorrowInterestRate, -18)
+					ratePerSecond := decimal.NewFromBigInt(rates.BorrowInterestRate, -18) // Assuming 1e18 scaled per-second rate
 					secondsPerYear := decimal.NewFromInt(365 * 24 * 60 * 60)
-					// Simple interest for APY: rate_per_second * seconds_in_year * 100
+					// Simple annualized interest rate
 					apyFromRaw := ratePerSecond.Mul(secondsPerYear).Mul(decimal.NewFromInt(100))
-					loanDetail.InterestRateAPY = apyFromRaw.StringFixed(2) + "%"
-					// TODO: Verify actual contract rate period (per second vs per block) and scaling for accurate APY.
+					loanDetail.InterestRateAPY = apyFromRaw.StringFixed(2) + "% (Annualized)"
+					// TODO: Verify contract's interest compounding period (per-second, per-block?)
+					// and implement precise APY calculation if it's compound interest. Current is simple annualized rate.
 				} else {
 					loanDetail.InterestRateAPY = "Error fetching rate"
 					utils.Warningf("GetLoans: Failed to get interest rates for base asset %s in market %s: %v", market.BaseTokenSymbol, market.ID, rateErr)
@@ -229,16 +230,21 @@ func (h *HydroApi) GetLoans(c echo.Context) error {
 				AssetAddress:    market.QuoteTokenAddress,
 				AssetSymbol:     market.QuoteTokenSymbol,
 				BorrowedAmount:  utils.BigWeiToDecimal(quoteBorrowedBigInt, int32(market.QuoteTokenDecimals)).StringFixed(market.PricePrecision), // Using PricePrecision for quote asset amount
-				AccruedInterest: "N/A", // Placeholder
+				// TODO: Implement AccruedInterest. This requires knowing the initial principal and borrow time
+				// for each loan component, typically from off-chain storage (e.g., a 'margin_loan_history' table).
+				// Current 'BorrowedAmount' from contract includes accrued interest.
+				AccruedInterest: "N/A",
 			}
 			if req.IncludeInterestRates {
 				rates, rateErr := sw.GetInterestRates(hydroSDK, quoteAssetAddr, big.NewInt(0))
 				if rateErr == nil && rates != nil && rates.BorrowInterestRate != nil {
-					ratePerSecond := decimal.NewFromBigInt(rates.BorrowInterestRate, -18)
+					ratePerSecond := decimal.NewFromBigInt(rates.BorrowInterestRate, -18) // Assuming 1e18 scaled per-second rate
 					secondsPerYear := decimal.NewFromInt(365 * 24 * 60 * 60)
+					// Simple annualized interest rate
 					apyFromRaw := ratePerSecond.Mul(secondsPerYear).Mul(decimal.NewFromInt(100))
-					loanDetail.InterestRateAPY = apyFromRaw.StringFixed(2) + "%"
-					// TODO: Verify actual contract rate period and scaling for accurate APY.
+					loanDetail.InterestRateAPY = apyFromRaw.StringFixed(2) + "% (Annualized)"
+					// TODO: Verify contract's interest compounding period (per-second, per-block?)
+					// and implement precise APY calculation if it's compound interest. Current is simple annualized rate.
 				} else {
 					loanDetail.InterestRateAPY = "Error fetching rate"
 					utils.Warningf("GetLoans: Failed to get interest rates for quote asset %s in market %s: %v", market.QuoteTokenSymbol, market.ID, rateErr)

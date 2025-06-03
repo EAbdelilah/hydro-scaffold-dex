@@ -2,6 +2,7 @@ import api from '../lib/api'; // Import the API library
 import { getSelectedAccountWallet } from '@gongddex/hydro-sdk-wallet';
 import { ethers } from 'ethers';
 import { clearTradeForm } from './trade'; // Import clearTradeForm
+import { showMarginAlert } from './notificationActions'; // Import for success notification
 
 // Action Type Constants
 export const SELECT_ACCOUNT_TYPE = 'margin/SELECT_ACCOUNT_TYPE';
@@ -98,67 +99,58 @@ export const refreshAllMarginDataForUserAndMarket = (marketID, userAddress, coll
 
 
 const walletService = {
-  signTransaction: async (unsignedTxData, getState) => {
-    // Conceptual placeholder for using @gongddex/hydro-sdk-wallet if its signTransaction is suitable
-    // const selectedAccount = getSelectedAccountWallet(getState());
-    // if (selectedAccount && selectedAccount.wallet && typeof selectedAccount.wallet.signTransaction === 'function') {
-    //   console.info("Attempting to sign with hydro-sdk-wallet (if method matches)...");
-    //   // TODO: Adapt unsignedTxData to the format expected by selectedAccount.wallet.signTransaction()
-    //   // This might involve different field names or types.
-    //   // const compatibleTx = { ... map unsignedTxData ... };
-    //   // try {
-    //   //   const signedTx = await selectedAccount.wallet.signTransaction(compatibleTx);
-    //   //   return signedTx; // Or extract raw hex if needed
-    //   // } catch (error) {
-    //   //   console.error("hydro-sdk-wallet signing failed, considering fallback or rethrowing:", error);
-    //   // }
-    // }
+  // signTransaction: async (unsignedTxData, getState) => { // getState removed
+  signTransaction: async (unsignedTxData) => {
+    console.log("walletService.signTransaction: Received unsignedTxData:", unsignedTxData);
 
-    // Primary implementation using ethers.js + window.ethereum
     if (!window.ethereum) {
-      throw new Error("Ethereum wallet (e.g., MetaMask) not detected.");
+        throw new Error("Ethereum wallet (e.g., MetaMask) not detected. Please install or enable your wallet.");
     }
-
-    // ethers is already imported statically at the top of the file.
-    // const ethers = await import('ethers'); // Dynamic import not strictly needed if static
-    const provider = new ethers.providers.Web3Provider(window.ethereum);
-    const signer = provider.getSigner();
-
-    const signerAddress = await signer.getAddress();
-    if (signerAddress.toLowerCase() !== unsignedTxData.from.toLowerCase()) {
-      throw new Error(`Wallet address mismatch. Expected ${unsignedTxData.from}, got ${signerAddress}. Please switch accounts in your wallet.`);
-    }
-
-    const txRequest = {
-      to: unsignedTxData.to,
-      from: unsignedTxData.from, // Required by some signers
-      nonce: ethers.BigNumber.from(unsignedTxData.nonce).toNumber(), // ethers.js v5 expects number for nonce
-      gasPrice: ethers.BigNumber.from(unsignedTxData.gasPrice),
-      gasLimit: ethers.BigNumber.from(unsignedTxData.gasLimit),
-      value: ethers.BigNumber.from(unsignedTxData.value || '0'), // Default value to '0' if not present
-      data: unsignedTxData.data, // Should be 0x-prefixed hex
-      chainId: parseInt(unsignedTxData.chainId)
-    };
-
-    console.log("Prepared transaction request for ethers.js:", txRequest);
 
     try {
-      // Populate transaction to ensure all fields are correctly formatted for the network/signer
-      // For some versions/cases, signer.signTransaction might not need prior populateTransaction
-      // if the txRequest is already complete. However, populateTransaction is safer.
-      const populatedTx = await signer.populateTransaction(txRequest);
-      console.log("Populated transaction for signing:", populatedTx);
-      const signedRawTxHex = await signer.signTransaction(populatedTx);
-      console.info("Transaction signed successfully via ethers.js:", signedRawTxHex);
-      return signedRawTxHex;
+        // Optional: Dynamically request accounts if not already connected
+        // await window.ethereum.request({ method: 'eth_requestAccounts' });
+
+        const provider = new ethers.providers.Web3Provider(window.ethereum);
+        const signer = provider.getSigner();
+        const signerAddress = await signer.getAddress();
+
+        // Strict check: unsignedTxData.from MUST match the signer's address for this flow.
+        if (unsignedTxData.from && signerAddress.toLowerCase() !== unsignedTxData.from.toLowerCase()) {
+            console.error(`Wallet address mismatch. Expected: ${unsignedTxData.from}, Wallet: ${signerAddress}.`);
+            throw new Error(`Wallet address mismatch. Expected ${unsignedTxData.from}, but selected account is ${signerAddress}. Please switch accounts in your wallet or ensure 'from' field is correct.`);
+        }
+
+        const txRequest = {
+            to: unsignedTxData.to,
+            // from: unsignedTxData.from, // Let ethers.js populate 'from' via signer.populateTransaction
+            nonce: ethers.BigNumber.from(unsignedTxData.nonce).toNumber(),
+            gasLimit: ethers.BigNumber.from(unsignedTxData.gasLimit),
+            gasPrice: ethers.BigNumber.from(unsignedTxData.gasPrice),
+            data: unsignedTxData.data,
+            value: ethers.BigNumber.from(unsignedTxData.value || '0'), // Keep default to '0'
+            chainId: parseInt(unsignedTxData.chainId)
+        };
+
+        console.log("walletService.signTransaction: Populating transaction:", txRequest);
+        const populatedTx = await signer.populateTransaction(txRequest);
+
+        // Remove 'from' if populated, as signTransaction often derives it from the signer itself
+        // delete populatedTx.from; // This can be necessary for some wallets/signers
+
+        console.log("walletService.signTransaction: Requesting signature for populated TX:", populatedTx);
+        const signedRawTxHex = await signer.signTransaction(populatedTx);
+
+        console.info("Transaction signed successfully:", signedRawTxHex);
+        return signedRawTxHex;
+
     } catch (error) {
-      console.error("Ethers.js signing error:", error);
-      if (error.code === 4001 || error.code === 'ACTION_REJECTED') { // Ethers v5 uses ACTION_REJECTED
-        throw new Error("Transaction signature rejected by user.");
-      }
-      // Attempt to get a more specific message if available
-      const mainReason = error.reason || (error.data ? error.data.message : (error.error ? error.error.message : error.message));
-      throw new Error(mainReason || "Failed to sign transaction with ethers.js.");
+        console.error("walletService.signTransaction: Error during signing:", error);
+        if (error.code === 4001 || error.code === 'ACTION_REJECTED') { // MetaMask user rejection or Ethers v5 rejection
+            throw new Error("Transaction signature rejected by user.");
+        }
+        const mainReason = error.reason || (error.data ? error.data.message : (error.error ? error.error.message : error.message));
+        throw new Error(mainReason || "Failed to sign transaction with wallet.");
     }
   }
 };
@@ -172,7 +164,7 @@ export const openMarginPosition = (params) => async (dispatch, getState) => {
       dispatch({ type: OPEN_MARGIN_POSITION_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
       try {
-        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        const signedTxHex = await walletService.signTransaction(unsignedTxData); // getState removed
         if (signedTxHex) {
           dispatch(broadcastMarginTransaction(signedTxHex, params.marketID, params.userAddress, params.collateralAssetSymbol, params.baseAssetSymbol, params.quoteAssetSymbol));
         } else {
@@ -205,7 +197,7 @@ export const initiateCloseMarginPosition = (marketID, userAddress, baseAssetSymb
       dispatch({ type: INITIATE_CLOSE_MARGIN_POSITION_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
       try {
-        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        const signedTxHex = await walletService.signTransaction(unsignedTxData); // getState removed
         if (signedTxHex) {
           dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, null, baseAssetSymbol, quoteAssetSymbol));
         } else {
@@ -243,6 +235,15 @@ export const broadcastMarginTransaction = (
     if (response.data.status === 0 && response.data.data && response.data.data.transactionHash) {
       const txHash = response.data.data.transactionHash;
       dispatch({ type: BROADCAST_MARGIN_TRANSACTION_SUCCESS, payload: { transactionHash: txHash } });
+
+      // Dispatch success notification
+      dispatch(showMarginAlert({
+        level: 'success',
+        message: `Transaction submitted: ${txHash.substring(0, 10)}...`, // Shorten for display
+        txHash: txHash,
+        autoDismiss: 5000
+      }));
+
       dispatch(clearTradeForm());
       let otherAssetForRefresh = baseAssetSymbol === collateralAssetSymbol ? quoteAssetSymbol : baseAssetSymbol;
       if (marketID && userAddress) {
@@ -256,11 +257,15 @@ export const broadcastMarginTransaction = (
     } else {
       const errorMsg = response.data.desc || 'Failed to broadcast margin transaction';
       dispatch({ type: BROADCAST_MARGIN_TRANSACTION_FAILURE, payload: { error: errorMsg } });
+      // Dispatch error notification for broadcast failure
+      dispatch(showMarginAlert({ level: 'error', message: `Transaction broadcast failed: ${errorMsg}` }));
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
       throw new Error(errorMsg);
     }
   } catch (error) {
     dispatch({ type: BROADCAST_MARGIN_TRANSACTION_FAILURE, payload: { error: error.message } });
+    // Dispatch error notification for broadcast failure (network error, etc.)
+    dispatch(showMarginAlert({ level: 'error', message: `Transaction broadcast failed: ${error.message}` }));
     dispatch({ type: SIGNING_MARGIN_TRANSACTION_COMPLETE });
     throw error;
   }
@@ -296,12 +301,9 @@ export const depositCollateral = (marketID, userAddress, assetAddress, assetSymb
       dispatch({ type: DEPOSIT_COLLATERAL_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
       try {
-        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        const signedTxHex = await walletService.signTransaction(unsignedTxData); // getState removed
         if (signedTxHex) {
-          // Determine base/quote symbols for refresh from marketID if possible, or pass them if available
-          // For deposit, collateralAssetSymbol is assetSymbol. The other market symbol might be needed.
-          // This part might need adjustment depending on how you get base/quote symbols for refresh.
-          const market = getState().market.markets[marketID];
+          const market = getState().market.markets[marketID]; // getState still needed here for market details
           const baseAssetSymbol = market ? market.baseTokenSymbol : null;
           const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
           dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
@@ -400,9 +402,9 @@ export const withdrawCollateral = (marketID, userAddress, assetAddress, assetSym
       dispatch({ type: WITHDRAW_COLLATERAL_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
       try {
-        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        const signedTxHex = await walletService.signTransaction(unsignedTxData); // getState removed
         if (signedTxHex) {
-          const market = getState().market.markets[marketID];
+          const market = getState().market.markets[marketID]; // getState still needed here
           const baseAssetSymbol = market ? market.baseTokenSymbol : null;
           const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
           dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
@@ -436,9 +438,9 @@ export const borrowLoanAction = (marketID, userAddress, assetAddress, assetSymbo
       dispatch({ type: BORROW_LOAN_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
       try {
-        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        const signedTxHex = await walletService.signTransaction(unsignedTxData); // getState removed
         if (signedTxHex) {
-          const market = getState().market.markets[marketID];
+          const market = getState().market.markets[marketID]; // getState still needed here
           const baseAssetSymbol = market ? market.baseTokenSymbol : null;
           const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
           dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));
@@ -472,9 +474,9 @@ export const repayLoanAction = (marketID, userAddress, assetAddress, assetSymbol
       dispatch({ type: REPAY_LOAN_UNSIGNED_TX_RECEIVED, payload: unsignedTxData });
       dispatch({ type: SIGNING_MARGIN_TRANSACTION_PENDING });
       try {
-        const signedTxHex = await walletService.signTransaction(unsignedTxData, getState());
+        const signedTxHex = await walletService.signTransaction(unsignedTxData); // getState removed
         if (signedTxHex) {
-          const market = getState().market.markets[marketID];
+          const market = getState().market.markets[marketID]; // getState still needed here
           const baseAssetSymbol = market ? market.baseTokenSymbol : null;
           const quoteAssetSymbol = market ? market.quoteTokenSymbol : null;
           dispatch(broadcastMarginTransaction(signedTxHex, marketID, userAddress, assetSymbol, baseAssetSymbol, quoteAssetSymbol));

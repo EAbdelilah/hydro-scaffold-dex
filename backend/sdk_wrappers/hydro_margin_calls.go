@@ -1029,168 +1029,212 @@ func GetMarketMarginParameters(hydro sdk.Hydro, marketID uint16) (*MarketMarginP
 		utils.Warningf("GetMarketMarginParameters: LiquidateRate from contract (getMarket) was nil for marketID %d. Defaulting to zero.", marketID)
 	}
 
-	// 2. Attempt to fetch InitialMarginFraction directly
-	imrFetchedFromChain := false
-	imrMethodName := "getInitialMarginFraction" // Or "initialMarginFraction", "getMarketIMR", etc.
+	// 2. Attempt to fetch InitialMarginFraction directly from chain.
+	// DEVELOPER NOTE: This relies on the user/integrator providing the complete and correct MarginContractABIJsonString.
+	imrSourcedFromChain := false
+	imrMethodName := "getInitialMarginFraction" // Standardized name, could be different in actual ABI
 	imrMethod, imrMethodExists := marginContractABI.Methods[imrMethodName]
+
 	if imrMethodExists {
-		imrArgsToPack := []interface{}{marketID}
-		imrPackedInput, packErr := imrMethod.Inputs.Pack(imrArgsToPack...) // Use imrMethod.Inputs here
+		imrArgsToPack := []interface{}{marketID} // Assuming it takes marketID
+		imrPackedInput, packErr := imrMethod.Inputs.Pack(imrArgsToPack...)
 		if packErr == nil {
 			imrCallData := append(imrMethod.ID, imrPackedInput...)
 			imrResultBytes, imrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: imrCallData}, nil)
 			if imrCallErr == nil && len(imrResultBytes) > 0 {
 				var imrBigInt *big.Int
-				unpackErr := imrMethod.Outputs.UnpackIntoInterface(&imrBigInt, imrResultBytes) // Assuming it returns uint256
-				if unpackErr == nil && imrBigInt != nil {
-					params.InitialMarginFraction = decimal.NewFromBigInt(imrBigInt, -18) // Assuming 1e18 scaled
-					imrFetchedFromChain = true
-					utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction fetched from chain: %s", marketID, params.InitialMarginFraction.String())
+				// Assuming the method returns a single uint256 value. Adjust if it returns a struct/tuple.
+				unpackResults, unpackErr := imrMethod.Outputs.Unpack(imrResultBytes)
+				if unpackErr == nil && len(unpackResults) > 0 {
+					imrBigInt, ok = unpackResults[0].(*big.Int)
+					if ok && imrBigInt != nil {
+						imrCandidate := decimal.NewFromBigInt(imrBigInt, -18) // Assuming 1e18 scaled
+						if imrCandidate.IsPositive() && imrCandidate.LessThan(decimal.NewFromInt(1)) {
+							params.InitialMarginFraction = imrCandidate
+							imrSourcedFromChain = true
+							utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction sourced from CHAIN: %s", marketID, params.InitialMarginFraction.String())
+						} else {
+							utils.Warningf("GetMarketMarginParameters for marketID %d: IMR from chain (%s) is invalid. Will try DB/Derivation.", marketID, imrCandidate.String())
+						}
+					} else {
+						utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to assert IMR from chain to *big.Int. Type was %T. Raw: %s", marketID, unpackResults[0], hexutil.Encode(imrResultBytes))
+					}
 				} else if unpackErr != nil {
-                     utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s: %v. Raw: %s", marketID, imrMethodName, unpackErr, hexutil.Encode(imrResultBytes))
-                }
+					utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s output: %v. Raw: %s", marketID, imrMethodName, unpackErr, hexutil.Encode(imrResultBytes))
+				}
 			} else if imrCallErr != nil {
-                 utils.Warningf("GetMarketMarginParameters for marketID %d: Call to %s failed: %v", marketID, imrMethodName, imrCallErr)
-            }
-		} else if packErr != nil {
-            utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v", marketID, imrMethodName, packErr)
-        }
+				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s failed: %v. Will try DB/Derivation.", marketID, imrMethodName, imrCallErr)
+			} else if len(imrResultBytes) == 0 && imrMethod.Outputs.Length() > 0 {
+				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s returned no data. Will try DB/Derivation.", marketID, imrMethodName)
+			}
+		} else {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v. Will try DB/Derivation.", marketID, imrMethodName, packErr)
+		}
+	} else {
+		utils.Infof("GetMarketMarginParameters for marketID %d: Method %s not found in ABI. Will try DB/Derivation for IMR.", marketID, imrMethodName)
 	}
 
-	// 3. Attempt to fetch MaintenanceMarginFraction directly
-	mmrFetchedFromChain := false
-	mmrMethodName := "getMaintenanceMarginFraction" // Or "maintenanceMarginFraction", "getMarketMMR", etc.
+	// 3. Attempt to fetch MaintenanceMarginFraction directly from chain.
+	mmrSourcedFromChain := false
+	mmrMethodName := "getMaintenanceMarginFraction" // Standardized name
 	mmrMethod, mmrMethodExists := marginContractABI.Methods[mmrMethodName]
+
 	if mmrMethodExists {
-		mmrArgsToPack := []interface{}{marketID}
+		mmrArgsToPack := []interface{}{marketID} // Assuming it takes marketID
 		mmrPackedInput, packErr := mmrMethod.Inputs.Pack(mmrArgsToPack...)
 		if packErr == nil {
 			mmrCallData := append(mmrMethod.ID, mmrPackedInput...)
 			mmrResultBytes, mmrCallErr := ethCl.CallContract(context.Background(), hydroSDKCommon.GethCallMsg{To: &MarginContractAddress, Data: mmrCallData}, nil)
 			if mmrCallErr == nil && len(mmrResultBytes) > 0 {
 				var mmrBigInt *big.Int
-				unpackErr := mmrMethod.Outputs.UnpackIntoInterface(&mmrBigInt, mmrResultBytes) // Assuming it returns uint256
-				if unpackErr == nil && mmrBigInt != nil {
-					params.MaintenanceMarginFraction = decimal.NewFromBigInt(mmrBigInt, -18) // Assuming 1e18 scaled
-					mmrFetchedFromChain = true
-					utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction fetched from chain: %s", marketID, params.MaintenanceMarginFraction.String())
+				unpackResults, unpackErr := mmrMethod.Outputs.Unpack(mmrResultBytes)
+				if unpackErr == nil && len(unpackResults) > 0 {
+					mmrBigInt, ok = unpackResults[0].(*big.Int)
+					if ok && mmrBigInt != nil {
+						mmrCandidate := decimal.NewFromBigInt(mmrBigInt, -18) // Assuming 1e18 scaled
+						if mmrCandidate.IsPositive() && mmrCandidate.LessThan(decimal.NewFromInt(1)) {
+							params.MaintenanceMarginFraction = mmrCandidate
+							mmrSourcedFromChain = true
+							utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction sourced from CHAIN: %s", marketID, params.MaintenanceMarginFraction.String())
+						} else {
+							utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from chain (%s) is invalid. Will try DB/Derivation.", marketID, mmrCandidate.String())
+						}
+					} else {
+						utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to assert MMR from chain to *big.Int. Type was %T. Raw: %s", marketID, unpackResults[0], hexutil.Encode(mmrResultBytes))
+					}
 				} else if unpackErr != nil {
-                    utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s: %v. Raw: %s", marketID, mmrMethodName, unpackErr, hexutil.Encode(mmrResultBytes))
-                }
+					utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to unpack %s output: %v. Raw: %s", marketID, mmrMethodName, unpackErr, hexutil.Encode(mmrResultBytes))
+				}
 			} else if mmrCallErr != nil {
-                utils.Warningf("GetMarketMarginParameters for marketID %d: Call to %s failed: %v", marketID, mmrMethodName, mmrCallErr)
-            }
-		} else if packErr != nil {
-            utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v", marketID, mmrMethodName, packErr)
-        }
-	}
-
-	// 4. Fallback to Database if IMR or MMR not fetched from chain
-	dbSourcedIMR := false
-	dbSourcedIMR := false
-	dbSourcedMMR := false
-	var marketDBRecord *models.Market // Declare here to use across IMR and MMR DB checks
-	var dbErr error                     // Declare here for the same reason
-
-	if !imrFetchedFromChain || !mmrFetchedFromChain {
-		utils.Infof("GetMarketMarginParameters for marketID %d: IMR and/or MMR not (fully) sourced from chain. Attempting DB fallback.", marketID)
-		marketDBRecord, dbErr = models.MarketDaoSql.FindMarketByMarketID(marketID)
-		if dbErr != nil || marketDBRecord == nil {
-			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to fetch market details from database or market not found: %v", marketID, dbErr)
-		}
-	}
-
-	// Attempt to use DB value for IMR if not from chain
-	if !imrFetchedFromChain && marketDBRecord != nil {
-		imrFromDB := marketDBRecord.InitialMarginFraction
-		if imrFromDB.IsPositive() && imrFromDB.LessThan(decimal.NewFromInt(1)) { // Validate: 0 < IMR < 1
-			params.InitialMarginFraction = imrFromDB
-			imrFetchedFromChain = true // Mark as sourced to prevent derivation later
-			dbSourcedIMR = true
-			utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction sourced from database: %s", marketID, params.InitialMarginFraction.String())
-		} else {
-			utils.Warningf("GetMarketMarginParameters for marketID %d: Invalid IMR value found in DB (%s). Will attempt derivation if needed.", marketID, imrFromDB.String())
-		}
-	}
-
-	// Attempt to use DB value for MMR if not from chain
-	if !mmrFetchedFromChain && marketDBRecord != nil {
-		mmrFromDB := marketDBRecord.MaintenanceMarginFraction
-		if mmrFromDB.IsPositive() && mmrFromDB.LessThan(decimal.NewFromInt(1)) { // Validate: 0 < MMR < 1
-			// Additional check: if IMR was sourced (either chain or DB), ensure MMR < IMR
-			if imrFetchedFromChain && params.InitialMarginFraction.LessThanOrEqual(mmrFromDB) {
-				utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from DB (%s) is not less than IMR (%s). Invalidating DB MMR.", marketID, mmrFromDB.String(), params.InitialMarginFraction.String())
-			} else {
-				params.MaintenanceMarginFraction = mmrFromDB
-				mmrFetchedFromChain = true // Mark as sourced
-				dbSourcedMMR = true
-				utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction sourced from database: %s", marketID, params.MaintenanceMarginFraction.String())
+				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s failed: %v. Will try DB/Derivation.", marketID, mmrMethodName, mmrCallErr)
+			} else if len(mmrResultBytes) == 0 && mmrMethod.Outputs.Length() > 0 {
+				utils.Warningf("GetMarketMarginParameters for marketID %d: Eth_call to %s returned no data. Will try DB/Derivation.", marketID, mmrMethodName)
 			}
 		} else {
-			utils.Warningf("GetMarketMarginParameters for marketID %d: Invalid MMR value found in DB (%s). Will attempt derivation if needed.", marketID, mmrFromDB.String())
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Failed to pack args for %s: %v. Will try DB/Derivation.", marketID, mmrMethodName, packErr)
+		}
+	} else {
+		utils.Infof("GetMarketMarginParameters for marketID %d: Method %s not found in ABI. Will try DB/Derivation for MMR.", marketID, mmrMethodName)
+	}
+
+	// 4. Fallback to Database if IMR or MMR not successfully sourced from chain.
+	var marketDBRecord *models.Market
+	var dbErr error
+	imrSourcedFromDB := false
+	mmrSourcedFromDB := false
+
+	if !imrSourcedFromChain || !mmrSourcedFromChain {
+		marketDBRecord, dbErr = models.MarketDaoSql.FindMarketByMarketID(marketID)
+		if dbErr != nil {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Error fetching market from DB: %v. Chain values or derivation will be used.", marketID, dbErr)
+		} else if marketDBRecord == nil {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: Market not found in DB. Chain values or derivation will be used.", marketID)
 		}
 	}
 
-	// If both IMR and MMR were sourced (either chain or DB), but are inconsistent, invalidate derived ones to trigger re-derivation.
-	if imrFetchedFromChain && mmrFetchedFromChain && params.InitialMarginFraction.LessThanOrEqual(params.MaintenanceMarginFraction) {
-		utils.Warningf("GetMarketMarginParameters for marketID %d: Sourced IMR (%s) is not greater than sourced MMR (%s). Invalidating both and falling back to derivation for consistency.", marketID, params.InitialMarginFraction.String(), params.MaintenanceMarginFraction.String())
-		imrFetchedFromChain = false // Force re-derivation or re-sourcing if one was from DB and other from chain
-		mmrFetchedFromChain = false
-		dbSourcedIMR = false // Reset DB flags too
-		dbSourcedMMR = false
-		params.InitialMarginFraction = decimal.Zero // Reset to ensure derivation logic runs correctly
-		params.MaintenanceMarginFraction = decimal.Zero
+	if !imrSourcedFromChain && marketDBRecord != nil {
+		imrFromDB := marketDBRecord.InitialMarginFraction
+		if imrFromDB.IsPositive() && imrFromDB.LessThan(decimal.NewFromInt(1)) {
+			params.InitialMarginFraction = imrFromDB
+			imrSourcedFromDB = true
+			utils.Infof("GetMarketMarginParameters for marketID %d: InitialMarginFraction sourced from DATABASE: %s", marketID, params.InitialMarginFraction.String())
+		} else {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: IMR from DB (%s) is invalid.", marketID, imrFromDB.String())
+		}
 	}
 
+	if !mmrSourcedFromChain && marketDBRecord != nil {
+		mmrFromDB := marketDBRecord.MaintenanceMarginFraction
+		if mmrFromDB.IsPositive() && mmrFromDB.LessThan(decimal.NewFromInt(1)) {
+			// If IMR is already sourced (chain or DB), validate MMR < IMR
+			currentIMR := params.InitialMarginFraction // Could be from chain or DB (if imrSourcedFromChain or imrSourcedFromDB is true)
+			if !currentIMR.IsZero() && mmrFromDB.GreaterThanOrEqual(currentIMR) { // Check if currentIMR is valid before comparing
+				utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from DB (%s) is not less than current IMR (%s). Invalidating DB MMR.", marketID, mmrFromDB.String(), currentIMR.String())
+			} else {
+				params.MaintenanceMarginFraction = mmrFromDB
+				mmrSourcedFromDB = true
+				utils.Infof("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction sourced from DATABASE: %s", marketID, params.MaintenanceMarginFraction.String())
+			}
+		} else {
+			utils.Warningf("GetMarketMarginParameters for marketID %d: MMR from DB (%s) is invalid.", marketID, mmrFromDB.String())
+		}
+	}
 
-	// 5. Final Fallback/Derivation logic if IMR or MMR still not populated robustly
-	if !mmrFetchedFromChain { // Not from chain and not from valid DB
-		utils.Warningf("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction is DERIVED from LiquidateRate as a final fallback. VERIFY THIS LOGIC.", marketID)
+	// Determine final source flags for logging
+	finalIMRSourced := imrSourcedFromChain || imrSourcedFromDB
+	finalMMRSourced := mmrSourcedFromChain || mmrSourcedFromDB
+
+	// 5. Consistency Check & Final Derivation Logic
+	// If both are sourced, check IMR > MMR. If not, clear both to trigger full derivation for consistency.
+	if finalIMRSourced && finalMMRSourced && params.InitialMarginFraction.LessThanOrEqual(params.MaintenanceMarginFraction) {
+		utils.Warningf("GetMarketMarginParameters for marketID %d: Sourced IMR (%s) is NOT GREATER THAN sourced MMR (%s). This is inconsistent. Both will be DERIVED.",
+			marketID, params.InitialMarginFraction.String(), params.MaintenanceMarginFraction.String())
+		params.InitialMarginFraction = decimal.Zero
+		params.MaintenanceMarginFraction = decimal.Zero
+		finalIMRSourced = false // Force derivation
+		finalMMRSourced = false // Force derivation
+	}
+
+	if !finalMMRSourced {
+		utils.Warningf("GetMarketMarginParameters for marketID %d: MaintenanceMarginFraction will be DERIVED. TODO: Verify derivation logic.", marketID)
 		if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
 			params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
 		} else {
-			params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05) // Fallback
-			utils.Warningf("GetMarketMarginParameters: LiquidateRate for marketID %d is %s (<= 1.0). MMR derivation might be incorrect. Defaulting MMR to %s.",
+			params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05) // Default if LiquidateRate is not sensible for derivation
+			utils.Warningf("GetMarketMarginParameters for marketID %d: LiquidateRate (%s) is <= 1.0. MMR derivation might be incorrect. Defaulting MMR to %s.",
 				marketID, params.LiquidateRate.String(), params.MaintenanceMarginFraction.String())
 		}
-		// TODO: Verify if this derivation of MMR from LiquidateRate (LiquidateRate - 1) is correct as per contract logic and system design.
 	}
 
-	if !imrFetchedFromChain { // Not from chain and not from DB (or DB value was invalid)
-		utils.Warningf("GetMarketMarginParameters for marketID %d: InitialMarginFraction is DERIVED from MaintenanceMarginFraction as a final fallback. VERIFY THIS LOGIC.", marketID)
-		// Ensure MaintenanceMarginFraction is populated (either from chain, DB, or derivation) before deriving IMR
-		if params.MaintenanceMarginFraction.IsZero() && !mmrFetchedFromChain {
-			// This case implies MMR derivation from LiquidateRate also resulted in zero or was skipped.
-			// We need a valid MMR to derive IMR. If LiquidateRate was <=1, MMR defaults to 0.05.
-			// If LiquidateRate itself was 0, then MMR would be -1 from derivation logic above, then overridden by 0.05.
-			// Re-evaluate MMR if it's still zero to prevent IMR from being just 0.10.
+	if !finalIMRSourced {
+		utils.Warningf("GetMarketMarginParameters for marketID %d: InitialMarginFraction will be DERIVED. TODO: Verify derivation logic.", marketID)
+		// Ensure MMR is set (either sourced or derived by now)
+		if params.MaintenanceMarginFraction.IsZero() { // Should not happen if MMR derivation ran
+			utils.Error("GetMarketMarginParameters Critical: MMR is zero before IMR derivation. This indicates a logic flaw.")
+			// Default MMR again to prevent IMR from being too low or zero.
 			if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
 				params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
 			} else {
 				params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05)
 			}
 		}
-		params.InitialMarginFraction = params.MaintenanceMarginFraction.Add(decimal.NewFromFloat(0.10))
-		// TODO: IMR is derived from placeholder MMR + 10% (absolute percentage points). Verify this placeholder logic against actual system requirements.
+		params.InitialMarginFraction = params.MaintenanceMarginFraction.Add(decimal.NewFromFloat(0.10)) // Example: IMR = MMR + 10%
 	}
 
-	sourceSummary := fmt.Sprintf("IMR Source: %s, MMR Source: %s",
-		getParamSource(imrFetchedFromChain, dbSourcedIMR),
-		getParamSource(mmrFetchedFromChain, dbSourcedMMR))
+	// Final consistency check after any derivation
+	if params.InitialMarginFraction.LessThanOrEqual(params.MaintenanceMarginFraction) {
+		utils.Criticalf("GetMarketMarginParameters for marketID %d: CRITICAL - Derived IMR (%s) is not greater than MMR (%s). Defaulting to ensure safety.",
+			marketID, params.InitialMarginFraction.String(), params.MaintenanceMarginFraction.String())
+		// Apply emergency defaults if logic failed to produce valid IMR > MMR
+		if params.LiquidateRate.GreaterThan(decimal.NewFromInt(1)) {
+			params.MaintenanceMarginFraction = params.LiquidateRate.Sub(decimal.NewFromInt(1))
+		} else {
+			params.MaintenanceMarginFraction = decimal.NewFromFloat(0.05)
+		}
+		params.InitialMarginFraction = params.MaintenanceMarginFraction.Add(decimal.NewFromFloat(0.05)) // Smaller gap for safety default
+	}
 
-	utils.Infof("GetMarketMarginParameters Final for marketID %d: LiquidateRate: %s, %s. BorrowEnable: %t.",
-		marketID, params.LiquidateRate.String(), sourceSummary, marketDataTuple.BorrowEnable)
+	imrSource := getParamSource(imrSourcedFromChain, imrSourcedFromDB, !finalIMRSourced || params.InitialMarginFraction.IsZero())
+	mmrSource := getParamSource(mmrSourcedFromChain, mmrSourcedFromDB, !finalMMRSourced || params.MaintenanceMarginFraction.IsZero())
+
+	utils.Infof("GetMarketMarginParameters Final for marketID %d: LiquidateRate (Chain): %s, IMR (%s): %s, MMR (%s): %s, BorrowEnable: %t.",
+		marketID, params.LiquidateRate.String(),
+		imrSource, params.InitialMarginFraction.String(),
+		mmrSource, params.MaintenanceMarginFraction.String(),
+		marketDataTuple.BorrowEnable)
 
 	return params, nil
 }
 
 // Helper function to describe parameter source for logging
-func getParamSource(isChain bool, isDB bool) string {
-	if isChain && !isDB { // implies it was truly from chain before DB check
+func getParamSource(isChain bool, isDB bool, isDerived bool) string {
+	if isChain {
 		return "Chain"
-	} else if isDB { // implies it was from DB (either because chain failed or was not attempted for this param)
+	}
+	if isDB {
 		return "Database"
 	}
+	// isDerived flag explicitly passed, or if neither chain nor DB, it's derived.
 	return "Derived"
 }
 
@@ -1288,18 +1332,16 @@ func PrepareLiquidateAccountDirectTransaction(
 	liquidatorAddress goEthereumCommon.Address, // The EOA that will send the liquidation transaction
 	userToLiquidate goEthereumCommon.Address,
 	marketID uint16,
+	// value *big.Int, // liquidateAccount is non-payable as per provided ABI
 ) (*UnsignedTxDataForClient, error) {
-	utils.Warningf("PrepareLiquidateAccountDirectTransaction is a placeholder and needs full implementation for nonce, gas, and chainID fetching for the liquidatorAddress: %s", liquidatorAddress.Hex())
+	// utils.Warningf("PrepareLiquidateAccountDirectTransaction is a placeholder and needs full implementation for nonce, gas, and chainID fetching for the liquidatorAddress: %s", liquidatorAddress.Hex())
 
-	if marginContractABI.Methods == nil { // Or check len(marginContractABI.Methods) == 0
+	if marginContractABI.Methods == nil {
 		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: Margin Contract ABI not initialized")
 	}
-	methodName := "liquidateAccount" // As per the Hydro.sol ABI provided by user
+	methodName := "liquidateAccount"
 	method, ok := marginContractABI.Methods[methodName]
 	if !ok {
-		// This assumes `liquidateAccount` is part of the marginContractABI.
-		// If it's on a different contract (e.g., a master Hydro contract), this check needs adjustment,
-		// or the method needs to be in marginContractABI.
 		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: method '%s' not found in Margin Contract ABI", methodName)
 	}
 
@@ -1309,25 +1351,51 @@ func PrepareLiquidateAccountDirectTransaction(
 	}
 	fullTxData := append(method.ID, packedArgs...)
 
-	// TODO: Get ethCl from hydro instance
-	// TODO: Fetch nonce for liquidatorAddress using ethCl.PendingNonceAt(context.Background(), liquidatorAddress)
-	// TODO: Suggest gas price using ethCl.SuggestGasPrice(context.Background())
-	// TODO: Estimate gas limit for this call (from liquidatorAddress, to MarginContractAddress, data: fullTxData, value: big.NewInt(0))
-	// TODO: Fetch chainID using ethCl.NetworkID(context.Background())
+	hydroEth, okEth := hydro.(*ethereum.EthereumHydro)
+	if !okEth {
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: hydro SDK object cannot be asserted to *ethereum.EthereumHydro")
+	}
+	ethCl := hydroEth.EthClient()
+	if ethCl == nil {
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: EthClient from hydro SDK is nil")
+	}
 
-	currentNonce := uint64(0)                   // Placeholder
-	currentGasPrice := big.NewInt(20000000000)  // 20 Gwei placeholder
-	estimatedGasLimit := uint64(300000)       // Placeholder gas limit
-	currentChainID := big.NewInt(1)          // Mainnet placeholder, should be fetched
-	txValue := big.NewInt(0)                  // liquidateAccount is non-payable
+	currentNonce, err := ethCl.PendingNonceAt(context.Background(), liquidatorAddress)
+	if err != nil {
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to get nonce for liquidator %s: %w", liquidatorAddress.Hex(), err)
+	}
 
-	// Using utils.Infof for consistency, assuming log.Printf might not be standard in this package's logging.
-	utils.Infof("PrepareLiquidateAccountDirectTransaction: Conceptual TX prepared for liquidator %s to liquidate user %s in market %d. Data: %s. NONCE/GAS ARE PLACEHOLDERS.",
+	currentGasPrice, err := ethCl.SuggestGasPrice(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to suggest gas price: %w", err)
+	}
+
+	txValue := big.NewInt(0) // liquidateAccount is non-payable
+	callMsg := hydroSDKCommon.GethCallMsg{
+		From:  liquidatorAddress,
+		To:    &MarginContractAddress,
+		Data:  fullTxData,
+		Value: txValue,
+	}
+	estimatedGasLimit, err := ethCl.EstimateGas(context.Background(), callMsg)
+	if err != nil {
+		utils.Errorf("PrepareLiquidateAccountDirectTransaction: Gas estimation failed for liquidator %s, user %s, market %d. Data: %s, Error: %v",
+			liquidatorAddress.Hex(), userToLiquidate.Hex(), marketID, hexutil.Encode(fullTxData), err)
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to estimate gas: %w", err)
+	}
+	estimatedGasLimit = estimatedGasLimit + (estimatedGasLimit / 5) // Add 20% buffer
+
+	currentChainID, err := ethCl.NetworkID(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("PrepareLiquidateAccountDirectTransaction: failed to get network ID: %w", err)
+	}
+
+	utils.Infof("PrepareLiquidateAccountDirectTransaction: TX prepared for liquidator %s to liquidate user %s in market %d. Data: %s.",
 		liquidatorAddress.Hex(), userToLiquidate.Hex(), marketID, hexutil.Encode(fullTxData))
 
 	return &UnsignedTxDataForClient{
-		From:     liquidatorAddress.Hex(), // Changed to Hex() for consistency with UnsignedTxDataForClient struct
-		To:       MarginContractAddress.Hex(), // Target is the Margin Contract
+		From:     liquidatorAddress.Hex(),
+		To:       MarginContractAddress.Hex(),
 		Nonce:    currentNonce,
 		GasPrice: currentGasPrice.String(),
 		GasLimit: estimatedGasLimit,
@@ -1336,7 +1404,6 @@ func PrepareLiquidateAccountDirectTransaction(
 		ChainID:  currentChainID.String(),
 	}, nil
 }
-
 
 // GetOraclePriceInQuote fetches the price of assetToPrice in terms of quoteAsset by using their respective USD prices.
 // E.g., how many quoteAssets is one unit of assetToPrice worth? (assetToPrice_USD / quoteAsset_USD)

@@ -13,7 +13,8 @@ const initialState = fromJS({
     amount: null,
     price: null,
     baseAssetSymbol: null,
-    quoteAssetSymbol: null
+    quoteAssetSymbol: null,
+    isClosingTradeContext: false // Added new field
   }
 });
 
@@ -29,14 +30,17 @@ export default function uiReducer(state = initialState, action) {
         amount: sizeToClose ? sizeToClose.toString() : '', // Ensure it's a string
         price: closePriceSuggestion ? closePriceSuggestion.toString() : '', // Ensure it's a string
         baseAssetSymbol,
-        quoteAssetSymbol
+        quoteAssetSymbol,
+        isClosingTradeContext: true // Set context to true
       }));
     }
     case CLEAR_TRADE_FORM_PREFILL:
-      return state.set('tradeFormPrefill', initialState.get('tradeFormPrefill'));
+      // Ensure full reset including the new field
+      return state.set('tradeFormPrefill', initialState.get('tradeFormPrefill').merge(fromJS({ isClosingTradeContext: false, active: false })));
 
     case LOCATION_CHANGE: // Clear prefill on navigation
-      return state.set('tradeFormPrefill', initialState.get('tradeFormPrefill'));
+      // Ensure full reset including the new field
+      return state.set('tradeFormPrefill', initialState.get('tradeFormPrefill').merge(fromJS({ isClosingTradeContext: false, active: false })));
 
     default:
       return state;

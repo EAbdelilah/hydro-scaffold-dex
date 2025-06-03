@@ -119,7 +119,7 @@ export default function marginReducer(state = initialState, action) {
       if (action.payload.marketID) { // Specific market update
         return state
           .setIn(successLoadingPath, false)
-          .setIn(['loansByMarket', action.payload.marketID], fromJS(action.payload.loans || { loans: [] }));
+          .setIn(['loansByMarket', action.payload.marketID], fromJS(action.payload.loans || [])); // Corrected fallback
       } else { // If it was a fetch for all loans, the payload should be structured accordingly
         // This part depends on how "fetch all loans" structures its payload.
         // For now, assuming it still comes per market or the reducer is updated if payload is a flat list.

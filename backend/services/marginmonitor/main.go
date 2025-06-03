@@ -10,12 +10,23 @@ import (
 	"github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers" // Assuming this is where GetAccountDetails etc. are
 	"github.com/HydroProtocol/hydro-sdk-backend/common"
 	"github.com/HydroProtocol/hydro-sdk-backend/sdk"
+	"context" // For Redis
+	"encoding/json" // For marshalling liquidation job
+	"os"      // For environment variables
+	"time"
+
+	"github.com/HydroProtocol/hydro-scaffold-dex/backend/connection" // For RedisClient
+	"github.com/HydroProtocol/hydro-scaffold-dex/backend/models"
+	"github.com/HydroProtocol/hydro-scaffold-dex/backend/sdk_wrappers" // Assuming this is where GetAccountDetails etc. are
+	"github.com/HydroProtocol/hydro-sdk-backend/common"
+	"github.com/HydroProtocol/hydro-sdk-backend/sdk"
 	"github.com/HydroProtocol/hydro-sdk-backend/sdk/ethereum" // For hydro instance initialization
 	"github.com/HydroProtocol/hydro-sdk-backend/utils"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/postgres" // GORM postgres dialect driver
 	"github.com/shopspring/decimal"
 	// "github.com/joho/godotenv/autoload" // For local .env loading, if used
+	"strconv" // For parsing interval string
 )
 
 // MarketInfoForMonitor holds details for a margin-enabled market relevant to the monitor.
@@ -401,20 +412,59 @@ func (s *MarginMonitorService) monitorPositions() {
 				// liquidatorAddress := common.HexToAddress(liquidatorAddressStr)
 				// unsignedTxData, prepErr := sdk_wrappers.PrepareBatchActionsTransaction(s.hydro, actions, liquidatorAddress, big.NewInt(0))
 				// if prepErr != nil {
-				//     utils.Errorf("MarginMonitor: Conceptually failed to prepare liquidation tx for user %s, market %d: %v", userAddress.Hex(), market.MarketID, prepErr)
-				//      // return or continue
-				// }
+				// Call PrepareLiquidateAccountDirectTransaction
+				liquidatorAddressStr := os.Getenv("HSK_LIQUIDATOR_ADDRESS")
+				if liquidatorAddressStr == "" {
+					utils.Errorf("MarginMonitor: HSK_LIQUIDATOR_ADDRESS not set. Cannot proceed with preparing liquidation for user %s, market %d.", userAddress.Hex(), market.MarketID)
+					continue // Continue to next user/market
+				}
+				liquidatorAddress := common.HexToAddress(liquidatorAddressStr)
+				if liquidatorAddress == (common.Address{}) {
+					utils.Errorf("MarginMonitor: Invalid HSK_LIQUIDATOR_ADDRESS: %s. Cannot proceed.", liquidatorAddressStr)
+					continue // Continue to next user/market
+				}
 
-				// // 3. Sign and Broadcast (if monitor handles this directly) OR Publish to dedicated queue
-				utils.Warningf("MarginMonitor: TODO - Step 3: Actually sign and broadcast liquidation for user %s, market %d, OR publish to dedicated liquidation queue.", userAddress.Hex(), market.MarketID)
-				// // Example if publishing:
-				// // liquidationTask := map[string]interface{}{"user": userAddress.Hex(), "marketID": market.MarketID, "unsignedTxData": unsignedTxData} // Or just user/marketID
-				// // errPublish := messagebus.PublishToQueue(s.redisClient.Client, "LIQUIDATION_JOB_QUEUE", liquidationTask) // Example queue name
-				// // if errPublish != nil {
-				// //    utils.Errorf("MarginMonitor: Failed to publish liquidation task for user %s, market %d: %v", userAddress.Hex(), market.MarketID, errPublish)
-				// // } else {
-				// //    utils.Infof("MarginMonitor: Published liquidation task for user %s, market %d to queue.", userAddress.Hex(), market.MarketID)
-				// // }
+				utils.Infof("MarginMonitor: Preparing liquidation transaction using liquidator EOA %s for user %s, market %d.", liquidatorAddress.Hex(), userAddress.Hex(), market.MarketID)
+				unsignedTxData, err := sdk_wrappers.PrepareLiquidateAccountDirectTransaction(
+					s.hydro, // The hydroSDK instance stored in the service
+					liquidatorAddress,
+					userAddress,        // userAddress of the account to be liquidated
+					market.MarketID,      // marketID of the account
+				)
+				if err != nil {
+					utils.Errorf("MarginMonitor: Failed to prepare liquidation transaction for user %s, market %d: %v", userAddress.Hex(), market.MarketID, err)
+					continue // Continue to next user/market
+				}
+				// utils.Infof("MarginMonitor: Prepared liquidation TX: %+v", unsignedTxData) // This can be very verbose
+
+				// Liquidation Execution Strategy 1: Publish to a dedicated Redis queue
+				utils.Warningf("MarginMonitor: ACTION REQUIRED: Liquidation transaction prepared for user %s, market %d. Publishing to liquidation queue.", userAddress.Hex(), market.MarketID)
+				liquidationJob := map[string]interface{}{
+					"userAddress":    userAddress.Hex(),
+					"marketID":       market.MarketID,
+					"unsignedTxData": unsignedTxData, // The full UnsignedTxDataForClient struct
+					"timestamp":      time.Now().Unix(),
+				}
+				jobBytes, marshalErr := json.Marshal(liquidationJob)
+				if marshalErr != nil {
+					utils.Errorf("MarginMonitor: Failed to marshal liquidation job for user %s, market %d: %v", userAddress.Hex(), market.MarketID, marshalErr)
+				} else {
+					queueName := "hydro_liquidation_needed_queue" // Define queue name
+					err = s.redisClient.Client.LPush(context.Background(), queueName, string(jobBytes)).Err()
+					if err != nil {
+						utils.Errorf("MarginMonitor: Failed to publish liquidation job for user %s, market %d to Redis queue '%s': %v", userAddress.Hex(), market.MarketID, queueName, err)
+					} else {
+						utils.Infof("MarginMonitor: Successfully published liquidation job for user %s, market %d to '%s'.", userAddress.Hex(), market.MarketID, queueName)
+					}
+				}
+
+				// STRATEGY 2: Monitor signs and broadcasts directly (requires secure private key for HSK_LIQUIDATOR_ADDRESS)
+				// utils.Warningf("MarginMonitor: ACTION REQUIRED: Liquidation transaction prepared for user %s, market %d. TODO: Implement direct signing and broadcasting if monitor handles this.", userAddress.Hex(), market.MarketID)
+				// This would involve:
+				// 1. Securely loading the private key for HSK_LIQUIDATOR_ADDRESS.
+				// 2. Using ethers.js-like functionality (in Go) or a Go Ethereum wallet to sign unsignedTxData.
+				// 3. Broadcasting the signed transaction using ethCl.SendTransaction.
+				// This is complex and has security implications for key management within the monitor service.
 			}
 		}
 	}

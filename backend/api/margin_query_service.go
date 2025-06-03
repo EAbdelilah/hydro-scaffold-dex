@@ -85,6 +85,21 @@ func (h *HydroApi) GetUserMarginPositions(c echo.Context) error {
 			quoteBorrowed = big.NewInt(0)
 		}
 
+		// Fetch Mark Price
+		var markPriceStr string = "N/A"
+		markPriceDecimal, errMarkPrice := sdk_wrappers.GetOraclePriceInQuote(hydroSDK, baseAssetAddr, quoteAssetAddr)
+		if errMarkPrice == nil {
+			if markPriceDecimal.Sign() > 0 {
+				// Price is in terms of quote token, format using market's PriceDecimals
+				markPriceStr = markPriceDecimal.StringFixed(int32(marketDB.PriceDecimals))
+			} else {
+				// Price is zero or negative, also treat as N/A or invalid
+				utils.Warningf("GetUserMarginPositions: Mark price for market %s (%s/%s) is zero or negative: %s", marketDB.ID, marketDB.BaseTokenSymbol, marketDB.QuoteTokenSymbol, markPriceDecimal.String())
+			}
+		} else {
+			utils.Warningf("GetUserMarginPositions: Could not fetch mark price for market %s (%s/%s): %v", marketDB.ID, marketDB.BaseTokenSymbol, marketDB.QuoteTokenSymbol, errMarkPrice)
+		}
+
 		detail := MarginPositionDetail{
 			MarketID:                  marketID_uint16,
 			MarketSymbol:              marketDB.ID, // Using MarketDao.ID as symbol (e.g., "HOT-DAI")
@@ -94,10 +109,30 @@ func (h *HydroApi) GetUserMarginPositions(c echo.Context) error {
 			DebtValueUSD:              utils.BigIntToDecimal(accountDetails.DebtsTotalUSDValue, 18).StringFixed(2),
 			IsLiquidatable:            accountDetails.Liquidatable,
 			AccountStatus:             sdk_wrappers.GetAccountStatusString(accountDetails.Status),
-			EntryPrice:                "N/A", // Placeholder
-			MarkPrice:                 "N/A", // Placeholder
-			UnrealizedPnL:             "N/A", // Placeholder
-			EstimatedLiquidationPrice: "N/A", // Placeholder
+			// TODO: Implement robust EntryPrice calculation. This typically requires off-chain storage of
+			// user's average entry price for their current position size in this market
+			// (e.g., from a 'margin_trades' table or by averaging opening trade prices).
+			EntryPrice:                "N/A",
+			MarkPrice:                 markPriceStr,
+			// UnrealizedPnL calculation:
+			// If EntryPrice were available as entryPrice_dec and MarkPrice as markPrice_dec:
+			//   unrealizedPnL_dec := decimal.Zero
+			//   size_dec, _ := decimal.NewFromString(detail.Size) // Assuming Size is base asset amount string
+			//   if detail.Side == "Long " + marketDB.BaseTokenSymbol {
+			//       unrealizedPnL_dec = markPrice_dec.Sub(entryPrice_dec).Mul(size_dec)
+			//   } else if detail.Side == "Short " + marketDB.BaseTokenSymbol {
+			//       unrealizedPnL_dec = entryPrice_dec.Sub(markPrice_dec).Mul(size_dec)
+			//   }
+			//   detail.UnrealizedPnL = unrealizedPnL_dec.StringFixed(marketDB.QuoteTokenDecimals) + " " + marketDB.QuoteTokenSymbol
+			UnrealizedPnL:             "N/A // Requires Entry Price",
+			// TODO: Implement EstimatedLiquidationPrice calculation. Formula depends on whether position is long or short,
+			// borrowed amounts (base/quote), collateral amounts (base/quote), their respective USD prices,
+			// and the MaintenanceMarginFraction (MMR) for the market.
+			// Example for a simple long (borrow quote, collateral quote):
+			// LiqPriceBase = (TotalDebtQuote - (TotalCollateralQuoteUSD * MMR_as_decimal)) / (BaseAssetAmount * (1 - MMR_as_decimal_for_base_if_diff_from_quote_mmr_in_formula))
+			// This is complex and needs careful derivation from contract logic/MMR definition (e.g. MMR is on total assets/debts or per-asset).
+			// It requires MaintenanceMarginFraction from sdk_wrappers.GetMarketMarginParameters.
+			EstimatedLiquidationPrice: "N/A",
 		}
 
 		// Determine Side and Size

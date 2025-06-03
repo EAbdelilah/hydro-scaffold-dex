@@ -3,14 +3,12 @@ import { connect } from 'react-redux';
 import { BigNumber } from 'bignumber.js';
 import {
   openMarginPosition,
-  // broadcastMarginTransaction, // Not dispatched directly from component anymore
-  // initiateCloseMarginPosition // Not part of this component's direct responsibility
 } from '../../actions/marginActions';
+import { createOrder } from '../../actions/trade'; // Import createOrder
 import { getSelectedAccountType } from '../../selectors/marginSelectors';
 import { clearTradeFormPrefill } from '../../actions/uiActions'; // Import new action
 import { selectAccountType } from '../../actions/marginActions'; // For switching to margin
 import { setCurrentMarket } from '../../actions/market'; // Assuming this action exists
-// import { TRADE_FORM_ID, clearTradeForm } from '../../actions/trade'; // clearTradeForm is dispatched by thunk
 
 // Conceptual: For a real form, you'd likely use redux-form or a similar library
 // and connect form values directly rather than local component state for inputs.
@@ -51,6 +49,13 @@ class Trade extends Component {
 
         dispatch(clearTradeFormPrefill()); // Clear the prefill state
     }
+
+    // VERIFY_WS_UPDATE:
+    // if (this.props.marginAccountDetails !== prevProps.marginAccountDetails) { // Assuming marginAccountDetails is mapped from getMarginAccountDetailsData
+    //   console.log('Trade.js: marginAccountDetails updated via WebSocket, re-running calculations.');
+    //   // this.updateMarginTradeCalculations(); // Example if calculations for collateral are done client-side
+    // }
+    // Also, if order book data (used for price clicking) is updated via WS, ensure it reflects if integrated.
   }
 
   componentWillUnmount() {
@@ -92,94 +97,105 @@ class Trade extends Component {
     // Convert inputs to BigNumber for validation and calculation
     const amountBN = new BigNumber(amount);
     const priceBN = new BigNumber(price);
-    const leverageBN = selectedAccountType === 'margin' ? new BigNumber(leverage) : new BigNumber(0);
+    // Leverage is not directly used when placing a standard order to close a position.
+    // const leverageBN = selectedAccountType === 'margin' ? new BigNumber(leverage) : new BigNumber(0);
 
-    if (amountBN.lte(0) || (priceBN.lte(0) && this.state.orderType !== 'market')) { // Assuming market order might not need price
-        alert('Amount and Price must be greater than 0 for limit orders.');
-        return;
+    if (amountBN.lte(0) || (priceBN.lte(0) && this.state.orderType !== 'market')) {
+      alert('Amount and Price must be greater than 0 for limit orders.');
+      return;
     }
 
+    // Default expires for orders (e.g., 100 years, as in existing trade action)
+    const expires = 86400 * 365 * 1000;
+
     if (selectedAccountType === 'margin') {
-      if (leverageBN.lte(0)) {
-        alert('Leverage must be greater than 0 for margin trades.');
-        return;
-      }
-      console.log('Attempting to open margin position');
-
-      const baseAssetSymbol = currentMarket.get('baseToken');
-      const quoteAssetSymbol = currentMarket.get('quoteToken');
-      let collateralAmountDecimal;
-      let collateralAssetSymbol;
-
-      // Simplified collateral calculation: (amount * price) / leverage
-      // Assumes collateral is always in the quote currency of the market.
-      // This might need adjustment based on actual margin system rules (e.g., cross-margin, specific collateral asset).
-      const positionValueInQuote = amountBN.times(priceBN);
-      collateralAmountDecimal = positionValueInQuote.div(leverageBN);
-      collateralAssetSymbol = quoteAssetSymbol;
-
-      // Conceptual: Client-side hint for available balance (backend will do the definitive check)
-      // const spendableCollateral = getSpendableCommonBalance(this.props.state, collateralAssetSymbol); // Needs this selector
-      // if (collateralAmountDecimal.gt(spendableCollateral)) {
-      //   alert(`Insufficient ${collateralAssetSymbol} balance for the required collateral.`);
-      //   return;
-      // }
-
-      const params = {
-        marketID: currentMarket.id,
-        side,
-        amount: amountBN.toString(),
-        price: priceBN.toString(), // Assuming limit order for now
-        leverage: leverageBN.toNumber(),
-        collateralAssetSymbol,
-        collateralAmount: collateralAmountDecimal.toString(),
-        userAddress,
-        baseAssetSymbol, // For refresh action context
-        quoteAssetSymbol // For refresh action context
-      };
-
+      console.log('Submitting standard order on margin account.');
+      // The createOrder action (from actions/trade.js) already handles:
+      // - setting accountType: 'margin'
+      // - setting marginMarketID: currentMarket.id
+      // These are sent to /orders/build, which should use GenerateMarginOrderDataHex.
       try {
-        // Dispatch the thunk that handles API call, signing, and broadcasting
-        await dispatch(openMarginPosition(params));
-      } catch (error) {
-        // Errors are handled by Redux state, but can catch here for component-specific feedback if needed
-        console.error('Open margin position initiation failed (component-level catch):', error);
-        // alert(`Error: ${error.message || 'Failed to initiate margin position.'}`); // Redux state should handle this
-      }
+        const result = await dispatch(createOrder(side, priceBN, amountBN, this.state.orderType, expires));
+        if (result && result.status === 0) {
+          console.log('Margin account order placed successfully via createOrder:', result);
+          // TODO: Clear local form state if createOrder was successful.
+          // Example: this.setState({ amount: '', price: '' });
 
-    } else {
-      // Existing spot trading logic would go here
-      console.log('Executing spot trade logic (placeholder)');
-      alert('Spot trading logic needs to be implemented.');
-      // Example: dispatch(spotTradeAction({ marketID: currentMarket.id, side, amount, price }));
+          // Check if this was a closing trade to dispatch specific notification
+          // if (this.props.isClosingTradeContext) { // isClosingTradeContext is true when form was prefilled for close
+          //   this.props.dispatch(showMarginAlert({
+          //     level: 'info', // Or 'success'
+          //     message: 'Closing trade submitted. Once confirmed and position is flat, you can "Settle & Withdraw".',
+          //     autoDismiss: 10000
+          //   }));
+          // }
+          // Note: The actual dispatch of this notification is better handled within the createOrder/trade success logic
+          // if it can be aware of the 'isClosingTradeContext'. For now, this comment serves as a placeholder for the idea.
+        } else {
+          console.error('Margin account order placement failed via createOrder:', result ? result.desc : 'Unknown error');
+          // Alerts are handled by createOrder
+        }
+      } catch (error) {
+        console.error('Dispatching createOrder for margin account failed:', error);
+        alert(`Error placing order on margin account: ${error.message || 'Unknown error'}`);
+      }
+    } else { // Spot Trading
+      console.log('Executing spot trade logic using createOrder.');
+      try {
+        const result = await dispatch(createOrder(side, priceBN, amountBN, this.state.orderType, expires));
+        if (result && result.status === 0) {
+          console.log('Spot order placed successfully via createOrder:', result);
+          // TODO: Clear local form state if createOrder was successful for spot trades.
+          // Example: this.setState({ amount: '', price: '' });
+        } else {
+          console.error('Spot order placement failed via createOrder:', result ? result.desc : 'Unknown error');
+        }
+      } catch (error) {
+        console.error('Dispatching createOrder for spot account failed:', error);
+        alert(`Error placing spot order: ${error.message || 'Unknown error'}`);
+      }
     }
   };
 
   render() {
     const {
       selectedAccountType,
-      isOpeningMarginPosition,
-      isClosingMarginPosition, // For disabling button if a close is in progress
-      isSigningInWallet,
-      isBroadcastingMarginTx,
+      isOpeningMarginPosition, // This state is for the openMarginPosition action
+      isClosingMarginPosition,
+      isSigningInWallet,      // This state is for marginActions (open/close/deposit etc.)
+      isBroadcastingMarginTx, // This state is for marginActions
       marginActionError,
       unsignedMarginTx,
-      lastMarginTxHash,
-      currentMarket
+      currentMarket,
+      isClosingTradeContext, // Mapped from state.ui.tradeFormPrefill
+      // TODO: Add props for standard order loading states if createOrder has them
+      // e.g., isBuildingOrder, isPlacingOrder, orderError from a different part of Redux state
     } = this.props;
 
-    const isProcessingMarginAction = isOpeningMarginPosition || isClosingMarginPosition || isSigningInWallet || isBroadcastingMarginTx;
-    // Basic validation for enabling submit button (can be more sophisticated)
-    const isFormInputValid = parseFloat(this.state.amount) > 0 && parseFloat(this.state.price) > 0 &&
-                             (selectedAccountType !== 'margin' || parseFloat(this.state.leverage) > 0);
+    // isProcessingMarginAction is specific to complex margin operations, not standard orders.
+    const isProcessingComplexMarginAction = isOpeningMarginPosition || isClosingMarginPosition || isSigningInWallet || isBroadcastingMarginTx;
 
+    const isFormInputValid = parseFloat(this.state.amount) > 0 &&
+                             (this.state.orderType === 'market' || parseFloat(this.state.price) > 0);
+
+    const submitButtonText = isClosingTradeContext
+      ? 'Submit Closing Trade'
+      : selectedAccountType === 'margin'
+        ? 'Place Margin Order'
+        : 'Place Order';
+
+    // TODO: The loading/feedback UI below is for the `openMarginPosition` flow.
+    // If `createOrder` flow is used, it currently relies on alerts.
+    // For a better UX, `createOrder` should dispatch actions to set loading/error/success states
+    // in Redux, and this component should map and display them.
+    // For this subtask, we'll keep the existing margin feedback UI, acknowledging it won't
+    // reflect the state of `createOrder` calls.
 
     return (
       <div style={{ border: '1px solid #ccc', padding: '20px', margin: '20px' }}>
         <h2>Trade ({selectedAccountType})</h2>
         <form onSubmit={this.handleSubmit}>
           <div>Market: {currentMarket ? currentMarket.id : 'N/A'}</div>
-          {/* ... other form inputs ... */}
           <div>
             <label>Side:</label>
             <select name="side" value={this.state.side} onChange={this.handleInputChange}>
@@ -197,20 +213,23 @@ class Trade extends Component {
           </div>
           {selectedAccountType === 'margin' && (
             <div>
-              <label>Leverage (e.g., 2, 2.5, 5):</label>
+              {/* Leverage is not directly used for placing a simple closing order on margin account.
+                  It's for opening new leveraged positions with the openMarginPosition action.
+                  Keeping it visible for now, but it won't be used by createOrder. */}
+              <label>Leverage (Not used for simple margin orders):</label>
               <input type="text" name="leverage" value={this.state.leverage} onChange={this.handleInputChange} />
             </div>
           )}
-          <button type="submit" disabled={isProcessingMarginAction || !isFormInputValid}>
-            {isOpeningMarginPosition ? 'Preparing Trade...' :
-             isSigningInWallet ? 'Awaiting Signature...' :
-             isBroadcastingMarginTx ? 'Broadcasting...' :
-             (selectedAccountType === 'margin' ? 'Open Margin Position' : 'Place Spot Order')}
+          <button type="submit" disabled={isProcessingComplexMarginAction || !isFormInputValid}>
+            {/* Text change based on context */}
+            {isProcessingComplexMarginAction ?
+              (isOpeningMarginPosition ? 'Preparing Trade...' : isSigningInWallet ? 'Awaiting Signature...' : 'Processing...') :
+              submitButtonText}
           </button>
         </form>
 
-        {/* UI Feedback Section */}
-        {selectedAccountType === 'margin' && (
+        {/* UI Feedback Section - Primarily for openMarginPosition flow */}
+        {selectedAccountType === 'margin' && isProcessingComplexMarginAction && (
           <div style={{ marginTop: '15px' }}>
             {isOpeningMarginPosition && <p>Communicating with backend to prepare margin trade...</p>}
             {unsignedMarginTx && isSigningInWallet && !isBroadcastingMarginTx && (
@@ -224,18 +243,15 @@ class Trade extends Component {
               </div>
             )}
             {isBroadcastingMarginTx && <p>Broadcasting transaction to the network...</p>}
-            {lastMarginTxHash && !marginActionError && !isProcessingMarginAction && (
-              <p style={{ color: 'green' }}>
-                Margin transaction successfully broadcasted! Hash: {this.props.lastMarginTxHash}
-              </p>
-            )}
-            {marginActionError && (
-              <p style={{ color: 'red' }}>
-                Error: {typeof marginActionError === 'object' ? JSON.stringify(marginActionError) : marginActionError.toString()}
-              </p>
-            )}
           </div>
         )}
+        {/* lastMarginTxHash display removed, handled by global MarginAlertDisplay now */}
+        {marginActionError && selectedAccountType === 'margin' && (
+          <p style={{ color: 'red' }}>
+            Error (Margin Operation): {typeof marginActionError === 'object' ? JSON.stringify(marginActionError) : marginActionError.toString()}
+          </p>
+        )}
+        {/* TODO: Add UI feedback for standard order placement (createOrder flow) */}
       </div>
     );
   }
@@ -260,10 +276,11 @@ const mapStateToProps = (state) => {
     unsignedMarginTx: marginRootState.get('unsignedMarginTx'),
     isBroadcastingMarginTx: marginUIState.get('isBroadcastingMarginTx', false),
     marginActionError: marginUIState.get('marginActionError'), // Generalized error
-    lastMarginTxHash: marginRootState.get('lastMarginTxHash'),
+    // lastMarginTxHash: marginRootState.get('lastMarginTxHash'), // Removed from here
     // Example for form submitting state if using redux-form
     // submitting: state.form[TRADE_FORM_ID] ? state.form[TRADE_FORM_ID].submitting : false,
-    tradeFormPrefill: state.ui.get('tradeFormPrefill') // Map the prefill state
+    tradeFormPrefill: state.ui.get('tradeFormPrefill'), // Map the prefill state
+    isClosingTradeContext: state.ui.getIn(['tradeFormPrefill', 'isClosingTradeContext'], false)
   };
 };
 
