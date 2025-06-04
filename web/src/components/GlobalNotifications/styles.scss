@@ -1,0 +1,29 @@
+.global-notifications-container {
+  position: fixed;
+  top: 70px; // Adjusted from 20px to be potentially below a standard header
+  right: 20px;
+  z-index: 2000; // Ensure it's above other content
+  width: 350px;
+  max-width: 90%; // Ensure it's responsive on smaller screens
+}
+
+.global-notification-item {
+  margin-bottom: 10px;
+  padding-right: 2.5rem; // Ensure space for the close button
+
+  .close {
+    // Bootstrap default close button is fine, but can be styled further if needed
+    // For example, to make it more prominent or adjust position:
+    // position: absolute;
+    // top: 0.75rem;
+    // right: 1.25rem;
+    // padding: 0;
+    // background-color: transparent;
+    // border: 0;
+  }
+
+  // Optional: Add specific styling for different alert levels beyond Bootstrap defaults
+  // &.alert-danger.font-weight-bold {
+  //   // Custom styles for liquidation_event alerts
+  // }
+}

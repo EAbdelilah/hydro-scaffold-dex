@@ -1,7 +1,11 @@
 import api from '../lib/api';
 import { getSelectedAccountWallet } from '@gongddex/hydro-sdk-wallet';
+import { getSelectedAccountType } from '../selectors/marginSelectors'; // Add this
 
 export const TRADE_FORM_ID = 'TRADE';
+// Action to clear form, if not already existing elsewhere
+export const clearTradeForm = () => ({ type: '@@redux-form/CLEAR_FIELDS', meta: { form: TRADE_FORM_ID, keepTouched: false, persistentSubmitErrors: false, fields: [] }});
+
 
 export const trade = (side, price, amount, orderType = 'limit', expires = 86400 * 365 * 1000) => {
   return async (dispatch, getState) => {
@@ -25,15 +29,28 @@ const createOrder = (side, price, amount, orderType, expires) => {
   return async (dispatch, getState) => {
     const state = getState();
     const currentMarket = state.market.getIn(['markets', 'currentMarket']);
+    const selectedAccountType = getSelectedAccountType(state); // Get selected account type
 
-    const buildOrderResponse = await api.post('/orders/build', {
-      amount,
-      price,
+    const buildOrderPayload = {
+      amount: amount.toString(), // Ensure amounts/prices are strings if API expects that
+      price: price.toString(),
       side,
       expires,
       orderType,
       marketID: currentMarket.id
-    });
+    };
+
+    if (selectedAccountType === 'margin' && currentMarket && currentMarket.get('borrowEnable')) {
+      buildOrderPayload.accountType = 'margin';
+      // marginMarketID is typically the same as marketID for the current context of placing an order in that market's margin pool
+      buildOrderPayload.marginMarketID = currentMarket.id;
+      // TODO: Backend /orders/build API needs to handle accountType and marginMarketID
+      // to construct Order.data correctly for margin trades (using sdk_wrappers.GenerateMarginOrderDataHex
+      // with appropriate balanceCategory and orderDataMarketID).
+    }
+    // If not 'margin', accountType can be omitted as backend `BuildOrderReq` has it as omitempty.
+
+    const buildOrderResponse = await api.post('/orders/build', buildOrderPayload); // Use the new payload
 
     if (buildOrderResponse.data.status !== 0) {
       return buildOrderResponse.data;
@@ -51,6 +68,15 @@ const createOrder = (side, price, amount, orderType, expires) => {
         method: 0
       });
 
+      // TODO: Notification for successful closing trade.
+      // This requires 'isClosingTradeContext' to be passed into createOrder, or another way to know the context.
+      // if (isClosingTradeContext && placeOrderResponse.data.status === 0) {
+      //   dispatch(showMarginAlert({ // Assuming showMarginAlert is imported or passed to dispatch
+      //     level: 'info',
+      //     message: 'Closing trade confirmed. If position is flat, you can now "Settle & Withdraw" from Open Positions.',
+      //     autoDismiss: 10000
+      //   }));
+      // }
       return placeOrderResponse.data;
     } catch (e) {
       alert(e);

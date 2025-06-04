@@ -78,6 +78,8 @@ type (
 		Price     string `json:"price"     validate:"required"`
 		Amount    string `json:"amount"    validate:"required"`
 		Expires   int64  `json:"expires"`
+		AccountType    string `json:"accountType,omitempty"`    // "spot" or "margin"
+		MarginMarketID string `json:"marginMarketID,omitempty"` // The marketID if accountType is "margin" (usually same as MarketID for order placement)
 	}
 
 	BuildOrderResp struct {
@@ -172,6 +174,17 @@ type (
 		SupportedOrderTypes    []string        `json:"supportedOrderTypes"`
 		MarketOrderMaxSlippage decimal.Decimal `json:"marketOrderMaxSlippage"`
 		MarketStatus
+
+		// Margin trading parameters
+		BorrowEnable         bool            `json:"borrowEnable"`
+		LiquidateRate        decimal.Decimal `json:"liquidateRate"`
+		WithdrawRate         decimal.Decimal `json:"withdrawRate"`
+		AuctionRatioStart    decimal.Decimal `json:"auctionRatioStart"`
+		AuctionRatioPerBlock decimal.Decimal `json:"auctionRatioPerBlock"`
+		BaseTokenBorrowAPY   decimal.Decimal `json:"baseTokenBorrowAPY,omitempty"`
+		BaseTokenSupplyAPY   decimal.Decimal `json:"baseTokenSupplyAPY,omitempty"`
+		QuoteTokenBorrowAPY  decimal.Decimal `json:"quoteTokenBorrowAPY,omitempty"`
+		QuoteTokenSupplyAPY  decimal.Decimal `json:"quoteTokenSupplyAPY,omitempty"`
 	}
 
 	MarketStatus struct {

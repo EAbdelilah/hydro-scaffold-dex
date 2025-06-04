@@ -42,6 +42,21 @@ func loadRoutes(e *echo.Echo) {
 	addRoute(e, "POST", "/orders", &PlaceOrderReq{}, PlaceOrder, authMiddleware)
 	addRoute(e, "DELETE", "/orders/:orderID", &CancelOrderReq{}, CancelOrder, authMiddleware)
 	addRoute(e, "GET", "/account/lockedBalances", &LockedBalanceReq{}, GetLockedBalance, authMiddleware)
+
+	// Margin Account Routes
+	addRoute(e, "GET", "/margin/accounts/:marketID", &MarginAccountDetailsReq{}, GetMarginAccountDetails, authMiddleware)
+	addRoute(e, "POST", "/margin/collateral/deposit", &CollateralManagementReq{}, DepositToCollateral, authMiddleware)
+	addRoute(e, "POST", "/margin/collateral/withdraw", &CollateralManagementReq{}, WithdrawFromCollateral, authMiddleware)
+
+	// Loan Management Routes
+	addRoute(e, "POST", "/margin/loans/borrow", &CollateralManagementReq{}, BorrowLoan, authMiddleware) // Reusing CollateralManagementReq for borrow
+	addRoute(e, "POST", "/margin/loans/repay", &CollateralManagementReq{}, RepayLoan, authMiddleware)    // Reusing CollateralManagementReq for repay
+	addRoute(e, "GET", "/margin/loans", &LoanListReq{}, GetLoans, authMiddleware)
+
+	// Margin Position Routes
+	addRoute(e, "GET", "/v1/margin/positions", &EmptyReq{}, GetUserMarginPositions, authMiddleware) // New route for listing positions
+	addRoute(e, "POST", "/v1/margin/positions/open", &OpenMarginPositionReq{}, OpenMarginPosition, authMiddleware)
+	addRoute(e, "POST", "/v1/margin/positions/close", &CloseMarginPositionReq{}, CloseMarginPosition, authMiddleware)
 }
 
 func addRoute(e *echo.Echo, method, url string, param Param, handler func(p Param) (interface{}, error), middlewares ...echo.MiddlewareFunc) {
@@ -134,6 +149,13 @@ func StartServer(ctx context.Context, startMetric func()) {
 
 	// init blockchain
 	hydro = ethereum.NewEthereumHydro(os.Getenv("HSK_BLOCKCHAIN_RPC_URL"), os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS"))
+
+	// Init SDK Wrappers
+	// HSK_HYBRID_EXCHANGE_ADDRESS is for the original Hydro exchange contract.
+	// HSK_MARGIN_CONTRACT_ADDRESS is for the new Margin contract.
+	if err := sdk_wrappers.InitHydroWrappers(os.Getenv("HSK_HYBRID_EXCHANGE_ADDRESS"), os.Getenv("HSK_MARGIN_CONTRACT_ADDRESS")); err != nil {
+		panic(fmt.Sprintf("Failed to initialize Hydro SDK Wrappers: %v", err))
+	}
 
 	//init database
 	models.Connect(os.Getenv("HSK_DATABASE_URL"))

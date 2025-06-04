@@ -38,6 +38,36 @@ export const loadTradeHistory = marketID => {
   };
 };
 
+export const FETCH_MARKET_MARGIN_PARAMETERS_REQUEST = 'market/FETCH_MARKET_MARGIN_PARAMETERS_REQUEST';
+export const FETCH_MARKET_MARGIN_PARAMETERS_SUCCESS = 'market/FETCH_MARKET_MARGIN_PARAMETERS_SUCCESS';
+export const FETCH_MARKET_MARGIN_PARAMETERS_FAILURE = 'market/FETCH_MARKET_MARGIN_PARAMETERS_FAILURE';
+
+export const fetchMarketMarginParameters = marketID => {
+  return async dispatch => {
+    dispatch({ type: FETCH_MARKET_MARGIN_PARAMETERS_REQUEST, payload: { marketID } });
+    try {
+      // Uses api.getMarketMarginParameters from web/src/lib/api.js
+      const response = await api.getMarketMarginParameters(marketID);
+
+      if (response.data.status === 0 && response.data.data) {
+        const parameters = response.data.data; // Direct use of data object
+        dispatch({
+          type: FETCH_MARKET_MARGIN_PARAMETERS_SUCCESS,
+          payload: { marketID, parameters }
+        });
+        return parameters;
+      } else {
+        const errorMsg = response.data.desc || 'Failed to fetch market margin parameters';
+        dispatch({ type: FETCH_MARKET_MARGIN_PARAMETERS_FAILURE, payload: { marketID, error: errorMsg } });
+        throw new Error(errorMsg);
+      }
+    } catch (error) {
+      dispatch({ type: FETCH_MARKET_MARGIN_PARAMETERS_FAILURE, payload: { marketID, error: error.message } });
+      throw error;
+    }
+  };
+};
+
 const formatMarket = market => {
   market.gasFeeAmount = new BigNumber(market.gasFeeAmount);
   market.asMakerFeeRate = new BigNumber(market.asMakerFeeRate);

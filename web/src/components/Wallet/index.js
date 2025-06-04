@@ -3,10 +3,12 @@ import PerfectScrollbar from 'perfect-scrollbar';
 import Selector from '../Selector';
 import Tokens from './Tokens';
 import Wrap from './Wrap';
+import MarginAccountPanel from './MarginAccountPanel'; // Added import
 import './styles.scss';
 
 const OPTIONS = [
   { value: 'tokens', name: 'Tokens' },
+  { value: 'margin', name: 'Margin' }, // Added Margin option
   { value: 'wrap', name: 'Wrap' },
   { value: 'unwrap', name: 'Unwrap' }
 ];
@@ -49,6 +51,8 @@ class Wallet extends React.PureComponent {
         return <Wrap type="wrap" />;
       case 'unwrap':
         return <Wrap type="unwrap" />;
+      case 'margin': // Added case for margin
+        return <MarginAccountPanel />;
       default:
         return <Tokens />;
     }
